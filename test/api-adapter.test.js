@@ -7,7 +7,11 @@ import {
   canonicalQuery,
   deduplicateVideos,
   extractWbiKeys,
+  normalizeOnlineStats,
+  normalizePageList,
   normalizeVideo,
+  normalizeVideoDetail,
+  parseOnlineCount,
   parseDuration,
   plainQuery,
   signWbiParams,
@@ -42,6 +46,15 @@ test("API 规范化过滤非视频卡并清理字段", () => {
   assert.equal(video.durationSeconds, 13 * 60 + 7);
   assert.deepEqual(video.tags, ["费德勒", "纳达尔", "澳网"]);
   assert.equal(video.sources[0].orderLabel, "播放");
+});
+
+test("搜索卡的互动零占位按缺失处理，等待详情接口给出权威零值", () => {
+  const video = normalizeVideo(rawVideo({ like: 0, favorites: 0, coin: 0, share: 0 }));
+  assert.equal(video.stats.likes, null);
+  assert.equal(video.stats.favorites, null);
+  assert.equal(video.stats.coins, null);
+  assert.equal(video.stats.shares, null);
+  assert.equal(video.stats.views, 12_000);
 });
 
 test("时长解析支持不补零和小时格式", () => {
@@ -226,4 +239,239 @@ test("任一路触发风控会取消另一 worker 并停止后续页", async () 
     (error) => error.kind === "risk",
   );
   assert.ok(calls.length <= 2);
+});
+
+const rawDetail = (bvid = "BV1TEST00001", overrides = {}) => ({
+  bvid,
+  aid: 456,
+  title: "完整标题",
+  desc: "完整简介",
+  pic: "//i0.hdslb.com/detail.jpg",
+  duration: 605,
+  pubdate: 1_710_000_000,
+  videos: 2,
+  owner: { name: "详情UP", mid: 99, face: "//i0.hdslb.com/up.jpg" },
+  stat: {
+    view: 50000,
+    like: 5000,
+    favorite: 2400,
+    reply: 300,
+    danmaku: 400,
+    coin: 1800,
+    share: 260,
+  },
+  pages: [
+    { cid: 101, page: 1, part: "上集", duration: 300 },
+    { cid: 102, page: 2, part: "下集", duration: 305 },
+  ],
+  ...overrides,
+});
+
+test("详情和分P规范化保留长期质量需要的权威统计", () => {
+  const detail = normalizeVideoDetail(rawDetail());
+  assert.equal(detail.stats.views, 50000);
+  assert.equal(detail.stats.favorites, 2400);
+  assert.equal(detail.stats.coins, 1800);
+  assert.equal(detail.pages.length, 2);
+  assert.equal(detail.pages[1].cid, 102);
+  assert.deepEqual(normalizePageList([{ cid: 9, page: 1, part: "P1" }, { cid: null }]), [{
+    cid: 9,
+    page: 1,
+    part: "P1",
+    durationSeconds: null,
+    dimension: null,
+  }]);
+});
+
+test("在线数字支持万、亿和加号近似值，并尊重 show_switch", () => {
+  assert.deepEqual(parseOnlineCount("1.7万+"), { value: 17000, approximate: true, raw: "1.7万+" });
+  assert.deepEqual(parseOnlineCount("2.1亿"), { value: 210000000, approximate: true, raw: "2.1亿" });
+  assert.deepEqual(parseOnlineCount("2,345+"), { value: 2345, approximate: true, raw: "2,345+" });
+  assert.equal(parseOnlineCount("--").value, null);
+
+  const online = normalizeOnlineStats({
+    total: "1.7万+",
+    count: "800",
+    show_switch: { total: true, count: false },
+  }, { bvid: "BV1TEST00001", cid: 101, page: 1, multiPart: true, selection: "first-page" });
+  assert.equal(online.total, 17000);
+  assert.equal(online.web, null);
+  assert.equal(online.visible.web, false);
+  assert.equal(online.scope, "page");
+  assert.equal(online.multiPart, true);
+});
+
+test("视频详情使用 TTL 缓存，结构性失败时降级到统计接口", async () => {
+  let now = 1000;
+  let detailCalls = 0;
+  let fallbackCalls = 0;
+  const adapter = new BilibiliSearchApiAdapter({
+    now: () => now,
+    detailTtl: 100,
+    enrichmentDelayMs: 0,
+    request: async (url) => {
+      if (url.includes("/archive/stat")) {
+        fallbackCalls += 1;
+        return { code: 0, data: { bvid: "BV1TEST00002", view: 12, like: 3, favorite: 2 } };
+      }
+      detailCalls += 1;
+      if (url.includes("BV1TEST00002")) return { code: -404, message: "not found" };
+      return { code: 0, data: rawDetail("BV1TEST00001") };
+    },
+  });
+  const first = await adapter.getVideoDetail("BV1TEST00001");
+  const cached = await adapter.getVideoDetail("BV1TEST00001");
+  assert.equal(first, cached);
+  assert.equal(detailCalls, 1);
+  now += 101;
+  await adapter.getVideoDetail("BV1TEST00001");
+  assert.equal(detailCalls, 2);
+
+  const partial = await adapter.getVideoDetail("BV1TEST00002");
+  assert.equal(partial.partial, true);
+  assert.equal(partial.source, "stat-fallback");
+  assert.equal(partial.stats.views, 12);
+  assert.equal(fallbackCalls, 1);
+});
+
+test("共享详情请求允许单个等待方取消，并在无人等待时取消底层请求", async () => {
+  let underlyingAborted = false;
+  const adapter = new BilibiliSearchApiAdapter({
+    request: (_url, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        underlyingAborted = true;
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    }),
+  });
+  const controller = new AbortController();
+  const pending = adapter.getVideoDetail("BV1TEST00001", { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(underlyingAborted, true);
+});
+
+test("批量详情按 BV 去重、限制并发并对普通缺失降级", async () => {
+  let active = 0;
+  let peak = 0;
+  const adapter = new BilibiliSearchApiAdapter({
+    enrichmentDelayMs: 0,
+    request: async (url) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      const bvid = new URL(url).searchParams.get("bvid");
+      if (bvid === "BV1TEST00003") return { code: -500, message: "temporary" };
+      return { code: 0, data: rawDetail(bvid) };
+    },
+  });
+  const result = await adapter.getVideoCards([
+    "BV1TEST00001",
+    "BV1TEST00001",
+    "BV1TEST00002",
+    "BV1TEST00003",
+  ], { concurrency: 2 });
+  assert.equal(result.requestedCount, 3);
+  assert.equal(result.enrichedCount, 2);
+  assert.equal(result.errors.length, 1);
+  assert.ok(peak <= 2);
+});
+
+test("批量补全遇到风控立即停止调度后续详情", async () => {
+  let calls = 0;
+  const adapter = new BilibiliSearchApiAdapter({
+    enrichmentDelayMs: 0,
+    request: async (url, { signal }) => {
+      calls += 1;
+      const bvid = new URL(url).searchParams.get("bvid");
+      if (bvid === "BV1TEST00001") return { code: -352, message: "risk" };
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve({ code: 0, data: rawDetail(bvid) }), 30);
+        signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      });
+    },
+  });
+  await assert.rejects(
+    adapter.getVideoCards([
+      "BV1TEST00001",
+      "BV1TEST00002",
+      "BV1TEST00003",
+      "BV1TEST00004",
+    ]),
+    (error) => error.kind === "risk",
+  );
+  assert.ok(calls <= 2);
+});
+
+test("在线人数自动选第一分P、明确 page scope，并使用短 TTL 缓存", async () => {
+  let calls = 0;
+  const adapter = new BilibiliSearchApiAdapter({
+    onlineTtl: 1000,
+    request: async (url) => {
+      calls += 1;
+      if (url.includes("/pagelist")) {
+        return { code: 0, data: rawDetail().pages };
+      }
+      assert.match(url, /cid=101/);
+      return { code: 0, data: { total: "2.4万+", count: "900+", show_switch: { total: 1, count: 1 } } };
+    },
+  });
+  const first = await adapter.getOnline("BV1TEST00001");
+  const cached = await adapter.getOnline("BV1TEST00001");
+  assert.deepEqual(first, cached);
+  assert.equal(calls, 2);
+  assert.equal(first.selection, "first-page");
+  assert.equal(first.scope, "page");
+  assert.equal(first.multiPart, true);
+  assert.equal(first.total, 24000);
+  assert.equal(first.web, 900);
+  const explicit = await adapter.getOnline("BV1TEST00001", { cid: 101, page: 2, part: "复用同一统计" });
+  assert.equal(calls, 2);
+  assert.equal(explicit.selection, "explicit");
+  assert.equal(explicit.page, 2);
+});
+
+test("在线 shortlist 按 BV 去重并返回便于降级的 Map", async () => {
+  const adapter = new BilibiliSearchApiAdapter({
+    enrichmentDelayMs: 0,
+    request: async () => ({ code: 0, data: { total: "321", count: "123" } }),
+  });
+  const video = {
+    bvid: "BV1TEST00001",
+    pages: [{ cid: 101, page: 1, part: "P1" }, { cid: 102, page: 2, part: "P2" }],
+  };
+  const result = await adapter.getOnlineForVideos([video, video]);
+  assert.equal(result.requestedCount, 1);
+  assert.equal(result.enrichedCount, 1);
+  assert.equal(result.onlineByBvid.get(video.bvid).total, 321);
+  assert.equal(result.onlineByBvid.get(video.bvid).multiPart, true);
+  assert.deepEqual(result.errors, []);
+});
+
+test("enrichStats 用详情零值覆盖搜索占位值，缺失项保留原始数据", async () => {
+  const adapter = new BilibiliSearchApiAdapter({
+    enrichmentDelayMs: 0,
+    request: async (url) => {
+      const bvid = new URL(url).searchParams.get("bvid");
+      if (bvid === "BV1TEST00002") return { code: -500, message: "temporary" };
+      return { code: 0, data: rawDetail(bvid, { stat: { ...rawDetail().stat, like: 0 } }) };
+    },
+  });
+  const source = [
+    normalizeVideo(rawVideo({ bvid: "BV1TEST00001", like: 999 })),
+    normalizeVideo(rawVideo({ bvid: "BV1TEST00002", like: 88 })),
+  ];
+  const result = await adapter.enrichStats(source);
+  assert.equal(result.enrichedVideos, result.videos);
+  assert.equal(result.videos[0].stats.likes, 0);
+  assert.equal(result.videos[0].enrichment.detail, "complete");
+  assert.equal(result.videos[1].stats.likes, 88);
+  assert.equal(result.videos[1].enrichment.detail, "unavailable");
+  assert.equal(result.errors.length, 1);
+  assert.equal(source[0].stats.likes, 999);
 });

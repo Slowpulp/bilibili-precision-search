@@ -1,52 +1,74 @@
-export const SCRIPT_VERSION = "1.0.0";
+export const SCRIPT_VERSION = "1.2.0";
 
+export const RELEVANCE_ADMISSION = Object.freeze({
+  fuzzyThreshold: 0.74,
+  relevanceBand: 0.05,
+  singleTerm: Object.freeze({ threshold: 0.45, minCoverage: 1 }),
+  shortQuery: Object.freeze({ threshold: 0.35, minCoverage: 0.5 }),
+  longQuery: Object.freeze({ threshold: 0.3, minCoverage: 0.4 }),
+});
+
+const COMMON_RECALL = Object.freeze({
+  threshold: RELEVANCE_ADMISSION.shortQuery.threshold,
+  minCoverage: RELEVANCE_ADMISSION.shortQuery.minCoverage,
+  fuzzyThreshold: RELEVANCE_ADMISSION.fuzzyThreshold,
+  relevanceBand: RELEVANCE_ADMISSION.relevanceBand,
+  orders: Object.freeze(["totalrank", "click", "pubdate", "stow", "dm"]),
+  pagesPerOrder: 3,
+  pageSize: 50,
+});
+
+function viewProfile({ id, label, shortDescription, relevanceWeight, signalWeight, qualityWeight }) {
+  return Object.freeze({
+    ...COMMON_RECALL,
+    id,
+    label,
+    shortDescription,
+    relevanceWeight,
+    signalWeight,
+    qualityWeight,
+  });
+}
+
+// MODE_PROFILES is retained as a compatibility export for the controller and
+// API adapter. Entries are now ranking views, not separate relevance modes:
+// every view uses the same admission rules and the same candidate pool.
 export const MODE_PROFILES = Object.freeze({
-  strict: Object.freeze({
-    id: "strict",
-    label: "严格",
-    shortDescription: "高覆盖、低容错，优先排除疑似无关内容",
-    threshold: 0.7,
-    minCoverage: 0.75,
-    fuzzyThreshold: 1,
-    relevanceWeight: 0.93,
-    relevanceBand: 0.04,
-    orders: Object.freeze(["totalrank", "click", "pubdate", "stow"]),
-    pagesPerOrder: 2,
-    pageSize: 50,
+  quality: viewProfile({
+    id: "quality",
+    label: "长期质量",
+    shortDescription: "优先展示长期累计表现与深度互动更强的内容",
+    relevanceWeight: 0.4,
+    signalWeight: 0.6,
+    qualityWeight: 0,
   }),
-  standard: Object.freeze({
-    id: "standard",
-    label: "标准",
-    shortDescription: "相关性优先，在小范围内用质量分调序",
-    threshold: 0.46,
-    minCoverage: 0.5,
-    fuzzyThreshold: 1,
-    relevanceWeight: 0.87,
-    relevanceBand: 0.05,
-    orders: Object.freeze(["totalrank", "click", "pubdate", "stow"]),
-    pagesPerOrder: 2,
-    pageSize: 50,
+  growth: viewProfile({
+    id: "growth",
+    label: "增长趋势",
+    shortDescription: "优先展示近期增速更快的内容；无快照时使用低置信度估算",
+    relevanceWeight: 0.35,
+    signalWeight: 0.55,
+    qualityWeight: 0.1,
   }),
-  exploration: Object.freeze({
-    id: "exploration",
-    label: "探索",
-    shortDescription: "放宽门槛，并加入弹幕排序以发现长尾内容",
-    threshold: 0.25,
-    minCoverage: 0.25,
-    fuzzyThreshold: 0.7,
-    relevanceWeight: 0.78,
-    relevanceBand: 0.07,
-    orders: Object.freeze(["totalrank", "click", "pubdate", "stow", "dm"]),
-    pagesPerOrder: 3,
-    pageSize: 50,
+  timeliness: viewProfile({
+    id: "timeliness",
+    label: "最新热播",
+    shortDescription: "综合发布时间与当前观看热度，质量仅作小幅辅助",
+    relevanceWeight: 0.35,
+    signalWeight: 0.55,
+    qualityWeight: 0.1,
   }),
 });
 
-export const DEFAULT_MODE = "standard";
+export const SORT_VIEW_PROFILES = MODE_PROFILES;
+export const DEFAULT_MODE = "quality";
+export const DEFAULT_SORT_VIEW = DEFAULT_MODE;
 export const RESULTS_PER_PAGE = 24;
 export const CACHE_TTL_MS = 5 * 60 * 1000;
-export const STORAGE_MODE_KEY = "bps:mode:v1";
+export const STORAGE_MODE_KEY = "bps:sort-view:v2";
 
 export function getModeProfile(mode) {
   return MODE_PROFILES[mode] ?? MODE_PROFILES[DEFAULT_MODE];
 }
+
+export const getSortViewProfile = getModeProfile;

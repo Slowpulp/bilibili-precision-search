@@ -2,7 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
 
-import { PrecisionSearchApp, currentContext, installLocationWatcher } from "../src/main.js";
+import {
+  PrecisionSearchApp,
+  balancedEnrichmentShortlist,
+  currentContext,
+  installLocationWatcher,
+} from "../src/main.js";
 
 function createDom() {
   return new JSDOM(`<!doctype html><html><body>
@@ -191,4 +196,91 @@ test("提交空查询会取消旧请求，迟到结果不能覆盖错误状态",
   await oldSearch;
   assert.equal(app.view.refs.statusTitle.textContent, "精准搜索未完成");
   assert.equal(app.view.shadow.querySelectorAll(".card").length, 0);
+});
+
+test("三种排序共用一次召回，并接入详情、在线数据与历史快照", async () => {
+  const dom = createDom();
+  let recallCount = 0;
+  let detailCount = 0;
+  let onlineCount = 0;
+  let recorded = [];
+  const video = canonicalVideo();
+  const adapter = {
+    async collectCandidates() {
+      recallCount += 1;
+      return {
+        videos: [video],
+        rawCount: 1,
+        validCount: 1,
+        uniqueCount: 1,
+        ignoredCount: 0,
+        duplicateCount: 0,
+        errors: [],
+      };
+    },
+    async enrichStats(videos, { onProgress }) {
+      detailCount += 1;
+      onProgress({ completed: 1, total: 1 });
+      return {
+        enrichedVideos: videos.map((item) => ({
+          ...item,
+          stats: { ...item.stats, views: 1_400, likes: 160, coins: 40, shares: 8 },
+          pages: [{ cid: 123, page: 1, part: "正片" }],
+          enrichment: { detail: "complete" },
+        })),
+        errors: [],
+        detailEnrichedCount: 1,
+        skippedBvids: [],
+      };
+    },
+    async getOnlineForVideos(videos, { onProgress }) {
+      onlineCount += 1;
+      onProgress({ completed: 1, total: 1 });
+      return {
+        onlineByBvid: new Map([[videos[0].bvid, { total: 88 }]]),
+        errors: [],
+        enrichedCount: 1,
+      };
+    },
+  };
+  const historyStore = {
+    snapshotsFor() {
+      return new Map([[video.bvid, [{
+        capturedAt: Date.now() - 60 * 60 * 1000,
+        stats: { views: 1_000, likes: 100, coins: 30, shares: 5 },
+      }]]]);
+    },
+    record(videos) { recorded = videos; },
+  };
+  const app = new PrecisionSearchApp({
+    documentRef: dom.window.document,
+    windowRef: dom.window,
+    adapter,
+    historyStore,
+  });
+  app.start();
+  await app.search("费德勒 2017 澳网 纳达尔");
+  assert.equal(recallCount, 1);
+  assert.equal(detailCount, 1);
+  assert.equal(onlineCount, 1);
+  assert.equal(recorded.length, 1);
+  assert.equal(app.activeSearch.rankings.growth.ranked[0].growth.status, "observed");
+  assert.equal(app.activeSearch.rankings.timeliness.ranked[0].timeliness.onlineCount, 88);
+
+  app.changeSort("growth");
+  assert.equal(recallCount, 1);
+  assert.equal(app.view.sort, "growth");
+  assert.match(app.view.refs.statusTitle.textContent, /增长趋势/);
+});
+
+test("补全 shortlist 在三个排序间轮询取样并按 BV 号去重", () => {
+  const a = { bvid: "BVA" };
+  const b = { bvid: "BVB" };
+  const c = { bvid: "BVC" };
+  const rankings = {
+    quality: { ranked: [{ video: a }, { video: b }] },
+    growth: { ranked: [{ video: b }, { video: c }] },
+    timeliness: { ranked: [{ video: c }, { video: a }] },
+  };
+  assert.deepEqual(balancedEnrichmentShortlist(rankings, 3), [a, b, c]);
 });

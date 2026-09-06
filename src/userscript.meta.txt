@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站精准搜索
 // @namespace    bilibili-precision-search.local
-// @version      1.0.0
-// @description  多路收集 B 站搜索候选，以相关性硬门槛过滤，再用质量分辅助重排并解释每条结果。
+// @version      1.2.0
+// @description  先以统一相关性门槛过滤 B站搜索，再按长期质量、增长趋势或最新热播进行可解释排序。
 // @author       Local userscript project
 // @license      MIT
 // @match        https://search.bilibili.com/*

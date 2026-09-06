@@ -1,5 +1,45 @@
-import { DEFAULT_MODE, MODE_PROFILES, RESULTS_PER_PAGE } from "./constants.js";
+import { DEFAULT_SORT_VIEW, RESULTS_PER_PAGE, SORT_VIEW_PROFILES } from "./constants.js";
 import { APP_STYLES } from "./style.js";
+
+const SORT_DESCRIPTIONS = Object.freeze({
+  quality: "优先累计收藏、投币、分享等长期沉淀，不给新视频额外加分",
+  growth: "优先近期真实增速；样本不足时明确标注平均增速估算或积累中",
+  timeliness: "优先发布时间与当前观看热度，长期质量仅作小幅辅助",
+});
+
+export const SORT_TABS = Object.freeze(Object.values(SORT_VIEW_PROFILES).map((profile) => Object.freeze({
+  id: profile.id,
+  label: profile.label,
+  description: SORT_DESCRIPTIONS[profile.id] ?? profile.shortDescription,
+})));
+
+export const DEFAULT_SORT = DEFAULT_SORT_VIEW;
+
+const SORT_TAB_MAP = new Map(SORT_TABS.map((tab) => [tab.id, tab]));
+
+const GROWTH_STATUS_LABELS = Object.freeze({
+  observed: "真实增速",
+  real: "真实增速",
+  measured: "真实增速",
+  actual: "真实增速",
+  estimated: "平均估算",
+  estimate: "平均估算",
+  average: "平均估算",
+  collecting: "积累中",
+  pending: "积累中",
+  unavailable: "积累中",
+  missing: "积累中",
+});
+
+const ONLINE_STATUS_LABELS = Object.freeze({
+  sampled: "在线已采样",
+  available: "在线已采样",
+  measured: "在线已采样",
+  missing: "在线采样缺失",
+  unavailable: "在线采样缺失",
+  skipped: "未采样在线人数",
+  pending: "在线采样中",
+});
 
 export const NATIVE_TAB_LABELS = new Set(["综合", "视频", "番剧", "影视", "直播", "专栏", "用户"]);
 
@@ -22,6 +62,7 @@ function element(documentRef, tag, className = "", text = "") {
 }
 
 export function formatCount(value) {
+  if (value === null || value === undefined || value === "") return "—";
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
   if (number >= 100_000_000) return `${(number / 100_000_000).toFixed(number >= 1_000_000_000 ? 0 : 1)}亿`;
@@ -33,6 +74,63 @@ export function formatDate(timestamp) {
   const value = Number(timestamp);
   if (!Number.isFinite(value) || value <= 0) return "日期未知";
   return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value));
+}
+
+function numericValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function formatScore(value) {
+  const number = numericValue(value);
+  return number === null ? "—" : String(Math.round(Math.min(1, Math.max(0, number)) * 100));
+}
+
+function itemCompleteness(item) {
+  const explicit = numericValue(item.dataCompleteness?.value ?? item.dataCompleteness ?? item.completeness);
+  if (explicit !== null) return Math.min(1, Math.max(0, explicit));
+  const available = [item.quality, item.growth, item.timeliness]
+    .map((score) => numericValue(score?.completeness))
+    .filter((value) => value !== null);
+  if (!available.length) return 0;
+  return available.reduce((sum, value) => sum + value, 0) / available.length;
+}
+
+function growthStatus(growth = {}) {
+  const raw = String(growth.status ?? growth.kind ?? "").toLocaleLowerCase();
+  if (GROWTH_STATUS_LABELS[raw]) return { key: raw, label: GROWTH_STATUS_LABELS[raw] };
+  if (growth.isReal === true || Number(growth.snapshotCount) >= 2) return { key: "real", label: "真实增速" };
+  if (growth.isEstimated === true) return { key: "estimated", label: "平均估算" };
+  if (Number(growth.snapshotCount) === 1) return { key: "collecting", label: "积累中" };
+  if (numericValue(growth.value) !== null) return { key: "estimated", label: "平均估算" };
+  return { key: "collecting", label: "积累中" };
+}
+
+function onlineSample(item) {
+  const timeliness = item.timeliness ?? {};
+  const count = numericValue(
+    timeliness.onlineCount ?? timeliness.online?.count ?? item.video?.stats?.online,
+  );
+  const raw = String(timeliness.onlineStatus ?? timeliness.online?.status ?? "").toLocaleLowerCase();
+  const key = count === null
+    ? raw === "pending" || raw === "skipped" ? raw : "missing"
+    : ONLINE_STATUS_LABELS[raw] ? raw : "sampled";
+  return {
+    count,
+    key,
+    label: count !== null ? `${ONLINE_STATUS_LABELS[key] ?? "在线已采样"} ${formatCount(count)}` : ONLINE_STATUS_LABELS[key],
+  };
+}
+
+function scoreReasons(score) {
+  if (!score) return [];
+  return [
+    ...(score.positiveReasons ?? []),
+    ...(score.negativeReasons ?? []),
+    ...(score.reasons ?? []),
+    ...(score.explanations ?? []),
+  ].filter(Boolean);
 }
 
 function setSafeImage(image, url, title) {
@@ -62,7 +160,7 @@ export class PrecisionSearchView {
     this.host = null;
     this.shadow = null;
     this.anchor = null;
-    this.mode = DEFAULT_MODE;
+    this.sort = DEFAULT_SORT;
     this.page = 1;
     this.result = null;
     this.pool = null;
@@ -71,6 +169,7 @@ export class PrecisionSearchView {
     this.resizeObserver = null;
     this.repositionFrame = null;
     this.lastProgressBucket = -1;
+    this.lastProgressStage = "";
   }
 
   mount() {
@@ -95,7 +194,7 @@ export class PrecisionSearchView {
                 </form>
                 <button class="secondary close-button" type="button">返回原生</button>
               </div>
-              <div class="mode-row"><div class="mode-group" role="group" aria-label="精准搜索模式"></div><p class="mode-note"></p></div>
+              <div class="sort-row"><div class="sort-group" role="tablist" aria-label="精准搜索排序方式"></div><p class="sort-note"></p></div>
             </div>
           </header>
           <main class="content">
@@ -105,7 +204,7 @@ export class PrecisionSearchView {
               <span class="sr-only live-status" role="status" aria-live="polite" aria-atomic="true"></span>
             </div>
             <div class="warning" hidden></div>
-            <div class="results-grid"></div>
+            <div class="results-grid" id="bps-results" role="tabpanel" aria-label="精准搜索结果列表"></div>
             <div class="state-view"></div>
             <nav class="pagination" aria-label="精准搜索结果分页" hidden></nav>
           </main>
@@ -120,8 +219,8 @@ export class PrecisionSearchView {
       form: this.shadow.querySelector(".search-form"),
       input: this.shadow.querySelector(".query-input"),
       close: this.shadow.querySelector(".close-button"),
-      modeGroup: this.shadow.querySelector(".mode-group"),
-      modeNote: this.shadow.querySelector(".mode-note"),
+      sortGroup: this.shadow.querySelector(".sort-group"),
+      sortNote: this.shadow.querySelector(".sort-note"),
       statusBox: this.shadow.querySelector(".status-box"),
       statusTitle: this.shadow.querySelector(".status-title"),
       statusDetail: this.shadow.querySelector(".status-detail"),
@@ -134,7 +233,7 @@ export class PrecisionSearchView {
       pagination: this.shadow.querySelector(".pagination"),
       liveStatus: this.shadow.querySelector(".live-status"),
     };
-    this.renderModeButtons();
+    this.renderSortTabs();
     this.bindEvents();
     this.positionToNativeTabs();
     return this;
@@ -159,26 +258,58 @@ export class PrecisionSearchView {
     this.window.addEventListener?.("scroll", () => this.schedulePosition(), { passive: true });
   }
 
-  renderModeButtons() {
-    this.refs.modeGroup.replaceChildren();
-    for (const profile of Object.values(MODE_PROFILES)) {
-      const button = element(this.document, "button", "mode-button", profile.label);
+  renderSortTabs() {
+    this.refs.sortGroup.replaceChildren();
+    for (const tab of SORT_TABS) {
+      const button = element(this.document, "button", "sort-button", tab.label);
       button.type = "button";
-      button.dataset.mode = profile.id;
-      button.title = profile.shortDescription;
-      button.setAttribute("aria-pressed", String(profile.id === this.mode));
-      button.addEventListener("click", () => this.handlers.onModeChange?.(profile.id));
-      this.refs.modeGroup.append(button);
+      button.setAttribute("role", "tab");
+      button.dataset.sort = tab.id;
+      button.title = tab.description;
+      button.setAttribute("aria-controls", "bps-results");
+      button.addEventListener("click", () => this.requestSort(tab.id));
+      button.addEventListener("keydown", (event) => this.handleSortKeydown(event, tab.id));
+      this.refs.sortGroup.append(button);
     }
-    this.setMode(this.mode);
+    this.setSort(this.sort, { render: false });
   }
 
-  setMode(mode) {
-    this.mode = MODE_PROFILES[mode] ? mode : DEFAULT_MODE;
-    this.shadow?.querySelectorAll(".mode-button").forEach((button) => {
-      button.setAttribute("aria-pressed", String(button.dataset.mode === this.mode));
+  requestSort(sort) {
+    if (!SORT_TAB_MAP.has(sort) || sort === this.sort) return;
+    this.setSort(sort);
+    this.refs.liveStatus.textContent = `已切换为${SORT_TAB_MAP.get(sort).label}排序`;
+    if (typeof this.handlers.onSortChange === "function") this.handlers.onSortChange(sort);
+    else this.handlers.onModeChange?.(sort);
+  }
+
+  handleSortKeydown(event, currentSort) {
+    const currentIndex = SORT_TABS.findIndex((tab) => tab.id === currentSort);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % SORT_TABS.length;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + SORT_TABS.length) % SORT_TABS.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = SORT_TABS.length - 1;
+    else return;
+    event.preventDefault();
+    const next = SORT_TABS[nextIndex];
+    this.refs.sortGroup.querySelector(`[data-sort="${next.id}"]`)?.focus();
+    this.requestSort(next.id);
+  }
+
+  setSort(sort, { render = true } = {}) {
+    this.sort = SORT_TAB_MAP.has(sort) ? sort : DEFAULT_SORT;
+    this.shadow?.querySelectorAll(".sort-button").forEach((button) => {
+      const active = button.dataset.sort === this.sort;
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
     });
-    if (this.refs) this.refs.modeNote.textContent = MODE_PROFILES[this.mode].shortDescription;
+    if (this.refs) this.refs.sortNote.textContent = SORT_TAB_MAP.get(this.sort).description;
+    if (render && this.result) this.renderCurrentPage();
+  }
+
+  // v1.0.x 主控制器的过渡入口；界面已不再呈现“模式”。
+  setMode(sort) {
+    this.setSort(sort);
   }
 
   setQuery(query) {
@@ -209,13 +340,29 @@ export class PrecisionSearchView {
     return Boolean(this.refs && !this.refs.panel.hidden);
   }
 
-  setLoading({ completed = 0, total = 1, candidateCount = 0, order = "", page = 1 } = {}) {
-    if (completed === 0 && candidateCount === 0 && !order) this.lastProgressBucket = -1;
+  setLoading({ stage = "recall", completed = 0, total = 1, candidateCount = 0, order = "", page = 1, message = "" } = {}) {
+    if (stage === "recall" && completed === 0) {
+      // Prevent a sort-tab click during the next request from rendering the
+      // previous query's retained result object back into the cleared grid.
+      this.result = null;
+      this.pool = null;
+      this.page = 1;
+    }
+    if (stage !== this.lastProgressStage || (completed === 0 && candidateCount === 0 && !order)) this.lastProgressBucket = -1;
+    this.lastProgressStage = stage;
     this.refs.panel.setAttribute("aria-busy", "true");
-    this.refs.statusTitle.textContent = `正在扩展候选池… ${completed}/${total}`;
-    this.refs.statusDetail.textContent = order
+    const stageLabels = {
+      recall: "正在扩展候选池",
+      details: "正在补齐长期质量数据",
+      history: "正在读取增长快照",
+      online: "正在采样当前观看热度",
+      ranking: "正在计算三维评分",
+    };
+    const stageLabel = stageLabels[stage] ?? "正在处理搜索结果";
+    this.refs.statusTitle.textContent = `${stageLabel}… ${completed}/${total}`;
+    this.refs.statusDetail.textContent = message || (order
       ? `正在读取 ${order} 排序第 ${page} 页，已取得 ${candidateCount} 条有效候选`
-      : "正在连接 B站搜索接口";
+      : stage === "recall" ? "正在连接 B站搜索接口" : `已处理 ${completed}/${total} 条候选`);
     this.refs.progressTrack.hidden = false;
     this.refs.progressBar.style.width = `${Math.round(Math.min(1, completed / Math.max(1, total)) * 100)}%`;
     this.refs.cancel.hidden = false;
@@ -226,25 +373,33 @@ export class PrecisionSearchView {
     const bucket = Math.floor(Math.min(1, completed / Math.max(1, total)) * 4);
     if (bucket > this.lastProgressBucket) {
       this.lastProgressBucket = bucket;
-      this.refs.liveStatus.textContent = `精准搜索进度 ${Math.round(bucket * 25)}%`;
+      this.refs.liveStatus.textContent = `${stageLabel} ${Math.round(bucket * 25)}%`;
     }
   }
 
   setResults(result, pool) {
     this.result = result;
     this.pool = pool;
+    const resultSort = result?.sort ?? result?.view ?? result?.profile?.id ?? result?.ranked?.[0]?.rank?.view;
+    if (SORT_TAB_MAP.has(resultSort)) this.setSort(resultSort, { render: false });
     this.page = 1;
     this.lastError = null;
     this.lastProgressBucket = -1;
+    this.lastProgressStage = "";
     this.refs.panel.setAttribute("aria-busy", "false");
     this.refs.cancel.hidden = true;
     this.refs.progressTrack.hidden = true;
-    this.refs.statusTitle.textContent = `保留 ${result.ranked.length} 条精准结果`;
+    this.refs.statusTitle.textContent = `保留 ${result.ranked.length} 条精准结果 · ${SORT_TAB_MAP.get(this.sort).label}`;
     this.refs.statusDetail.textContent = `接口返回 ${pool.rawCount} 条 · 有效 ${pool.validCount} 条 · 去重 ${pool.uniqueCount} 条 · 门槛过滤 ${result.rejected.length} 条`;
     this.refs.liveStatus.textContent = `精准搜索完成，保留 ${result.ranked.length} 条结果`;
-    if (pool.errors.length) {
+    const candidateErrorCount = pool.errors?.length ?? 0;
+    const enrichmentErrorCount = pool.enrichmentErrors?.length ?? 0;
+    if (candidateErrorCount || enrichmentErrorCount) {
       this.refs.warning.hidden = false;
-      this.refs.warning.textContent = `${pool.errors.length} 路候选请求未完成；已用其余成功结果排序。`;
+      const warnings = [];
+      if (candidateErrorCount) warnings.push(`${candidateErrorCount} 路候选请求未完成`);
+      if (enrichmentErrorCount) warnings.push(`有 ${enrichmentErrorCount} 项详情或在线数据补全失败，已按可用数据降级`);
+      this.refs.warning.textContent = `${warnings.join("；")}。`;
     } else {
       this.refs.warning.hidden = true;
     }
@@ -256,6 +411,7 @@ export class PrecisionSearchView {
     this.pool = null;
     this.lastError = error;
     this.lastProgressBucket = -1;
+    this.lastProgressStage = "";
     this.refs.panel.setAttribute("aria-busy", "false");
     this.refs.cancel.hidden = true;
     this.refs.progressTrack.hidden = true;
@@ -270,6 +426,7 @@ export class PrecisionSearchView {
 
   setCancelled() {
     this.lastProgressBucket = -1;
+    this.lastProgressStage = "";
     this.refs.panel.setAttribute("aria-busy", "false");
     this.refs.cancel.hidden = true;
     this.refs.progressTrack.hidden = true;
@@ -296,11 +453,15 @@ export class PrecisionSearchView {
     this.refs.grid.replaceChildren();
     this.refs.stateView.replaceChildren();
     if (!this.result?.ranked.length) {
-      const profile = MODE_PROFILES[this.mode];
+      const threshold = numericValue(this.result?.stats?.threshold);
+      const minCoverage = numericValue(this.result?.stats?.minCoverage);
+      const limits = threshold === null || minCoverage === null
+        ? "当前查询没有内容达到统一相关性准入规则。"
+        : `当前相关性至少 ${Math.round(threshold * 100)} 分、覆盖至少 ${Math.round(minCoverage * 100)}%。`;
       this.refs.stateView.append(this.buildState(
         "empty",
         "没有结果通过相关性硬门槛",
-        `当前为${profile.label}模式（相关性至少 ${Math.round(profile.threshold * 100)} 分、覆盖至少 ${Math.round(profile.minCoverage * 100)}%）。可核对关键词，或切换到探索模式。`,
+        `${limits} 可核对关键词、引号短语、型号或排除词后重试。`,
       ));
       this.refs.pagination.hidden = true;
       return;
@@ -315,15 +476,23 @@ export class PrecisionSearchView {
   }
 
   buildCard(item) {
-    const { video, relevance, quality } = item;
+    const { video, relevance } = item;
+    const quality = item.quality ?? {};
+    const growth = item.growth ?? {};
+    const timeliness = item.timeliness ?? {};
+    const selectedScore = item[this.sort] ?? quality;
+    const selectedTab = SORT_TAB_MAP.get(this.sort);
+    const completeness = itemCompleteness(item);
+    const growthState = growthStatus(growth);
+    const online = onlineSample(item);
     const card = element(this.document, "article", "card");
     const coverLink = externalLink(this.document, "cover-link", "", video.url);
     const image = element(this.document, "img", "cover");
     setSafeImage(image, video.coverUrl, video.title);
     coverLink.append(image);
     if (video.durationText) coverLink.append(element(this.document, "span", "duration", video.durationText));
-    const sourceLabels = [...new Set(video.sources.map((source) => source.orderLabel))];
-    coverLink.append(element(this.document, "span", "source-badge", `${sourceLabels.length} 路召回`));
+    const sourceLabels = [...new Set((video.sources ?? []).map((source) => source.orderLabel).filter(Boolean))];
+    coverLink.append(element(this.document, "span", "source-badge", sourceLabels.length ? `${sourceLabels.length} 路召回` : "候选来源未知"));
 
     const body = element(this.document, "div", "card-body");
     body.append(externalLink(this.document, "card-title", video.title || video.bvid, video.url));
@@ -343,33 +512,95 @@ export class PrecisionSearchView {
     );
     body.append(metrics);
     const scores = element(this.document, "div", "scores");
-    scores.append(
-      element(this.document, "span", "score score-relevance", `相关 ${Math.round(relevance.value * 100)}`),
-      element(this.document, "span", "score score-quality", `质量 ${Math.round(quality.value * 100)}`),
-    );
+    const scoreDefinitions = [
+      { key: "relevance", label: "相关", longLabel: "相关性", value: relevance?.value },
+      { key: "quality", label: "Q", longLabel: "长期质量", value: quality.value },
+      { key: "growth", label: "G", longLabel: "增长趋势", value: growth.value },
+      { key: "timeliness", label: "T", longLabel: "最新热播", value: timeliness.value },
+    ];
+    for (const score of scoreDefinitions) {
+      const badge = element(
+        this.document,
+        "span",
+        `score score-${score.key}${score.key === this.sort ? " is-selected" : ""}`,
+        `${score.label} ${formatScore(score.value)}`,
+      );
+      badge.title = `${score.longLabel}评分：${formatScore(score.value)}`;
+      scores.append(badge);
+    }
     body.append(scores);
-    const primaryReason = relevance.positiveReasons[0] ?? quality.positiveReasons[0] ?? "通过相关性硬门槛";
-    body.append(element(this.document, "p", "reason-primary", primaryReason));
+
+    const dataSignals = element(this.document, "div", "data-signals");
+    const completenessBadge = element(this.document, "span", "data-signal completeness", `数据 ${Math.round(completeness * 100)}%`);
+    completenessBadge.title = "质量、增长、时效三项评分的数据完整度";
+    const growthBadge = element(this.document, "span", `data-signal growth-status status-${growthState.key}`, growthState.label);
+    const observationHours = numericValue(growth.observationHours);
+    growthBadge.title = growthState.label === "真实增速" && observationHours !== null
+      ? `根据约 ${observationHours.toFixed(observationHours >= 10 ? 0 : 1)} 小时采样窗口计算`
+      : growthState.label === "平均估算"
+        ? "尚无足够历史快照，按发布以来平均增速估算"
+        : "需要后续采样才能计算真实增速";
+    const onlineBadge = element(this.document, "span", `data-signal online-status status-${online.key}`, online.label ?? "在线采样缺失");
+    onlineBadge.title = online.count === null
+      ? "当前未取得正在观看人数；时效分已对缺失数据作中性处理"
+      : "当前页面周期内采样到的正在观看人数，数值可能随时间波动";
+    dataSignals.append(completenessBadge, growthBadge, onlineBadge);
+    body.append(dataSignals);
+
+    const primaryReason = scoreReasons(selectedScore)[0] ?? relevance?.positiveReasons?.[0] ?? "通过相关性硬门槛";
+    body.append(element(this.document, "p", "reason-primary", `${selectedTab.label}：${primaryReason}`));
 
     const chips = element(this.document, "div", "match-list");
-    for (const match of relevance.matchedTerms.slice(0, 6)) {
+    for (const match of (relevance?.matchedTerms ?? []).slice(0, 6)) {
       const suffix = match.fuzzy ? "≈" : "→";
       chips.append(element(this.document, "span", "match-chip", `${match.term}${suffix}${match.fields.join("/")}`));
     }
     if (chips.childElementCount) body.append(chips);
 
     const details = element(this.document, "details", "explanations");
-    details.append(element(this.document, "summary", "", "查看匹配与质量说明"));
-    const list = element(this.document, "ul");
-    const reasons = [
-      ...relevance.positiveReasons,
-      ...relevance.negativeReasons,
-      ...quality.positiveReasons,
-      ...quality.negativeReasons,
-      `候选来源：${sourceLabels.join("、")}`,
-    ];
-    for (const reason of [...new Set(reasons)].slice(0, 8)) list.append(element(this.document, "li", "", reason));
-    details.append(list);
+    details.append(element(this.document, "summary", "", "查看相关性与三维评分说明"));
+    const explanationGroups = element(this.document, "div", "explanation-groups");
+    const appendGroup = (label, reasons, fallback) => {
+      const group = element(this.document, "section", "explanation-group");
+      group.append(element(this.document, "h4", "", label));
+      const list = element(this.document, "ul");
+      const uniqueReasons = [...new Set(reasons.filter(Boolean))].slice(0, 4);
+      for (const reason of uniqueReasons.length ? uniqueReasons : [fallback]) {
+        list.append(element(this.document, "li", "", reason));
+      }
+      group.append(list);
+      explanationGroups.append(group);
+    };
+    appendGroup(
+      `相关性 ${formatScore(relevance?.value)}`,
+      [...(relevance?.positiveReasons ?? []), ...(relevance?.negativeReasons ?? [])],
+      "已通过统一相关性硬门槛",
+    );
+    appendGroup(`长期质量 Q ${formatScore(quality.value)}`, scoreReasons(quality), "长期质量数据不足，评分已向中性收缩");
+    appendGroup(
+      `增长趋势 G ${formatScore(growth.value)}`,
+      [
+        ...scoreReasons(growth),
+        growthState.label === "真实增速" && observationHours !== null ? `采用约 ${observationHours.toFixed(1)} 小时的真实采样增量` : "",
+        growthState.label === "平均估算" ? "当前按发布以来平均增速估算，尚不代表近期真实增长" : "",
+        growthState.label === "积累中" ? "历史快照不足，增长数据仍在积累中" : "",
+      ],
+      "增长数据仍在积累中",
+    );
+    appendGroup(
+      `最新热播 T ${formatScore(timeliness.value)}`,
+      [
+        ...scoreReasons(timeliness),
+        online.count === null ? "正在观看人数未取得，在线信号按缺失处理" : `在线采样：${formatCount(online.count)} 人正在观看`,
+      ],
+      "按发布时间评估；当前没有可用的在线采样",
+    );
+    appendGroup(
+      "候选来源",
+      sourceLabels.length ? [`来自${sourceLabels.length}路召回：${sourceLabels.join("、")}`] : [],
+      "候选来源未记录",
+    );
+    details.append(explanationGroups);
     body.append(details);
     card.append(coverLink, body);
     return card;

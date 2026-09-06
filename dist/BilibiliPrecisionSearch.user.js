@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站精准搜索
 // @namespace    bilibili-precision-search.local
-// @version      1.0.0
-// @description  多路收集 B 站搜索候选，以相关性硬门槛过滤，再用质量分辅助重排并解释每条结果。
+// @version      1.2.0
+// @description  先以统一相关性门槛过滤 B站搜索，再按长期质量、增长趋势或最新热播进行可解释排序。
 // @author       Local userscript project
 // @license      MIT
 // @match        https://search.bilibili.com/*
@@ -14,51 +14,65 @@
 
 (() => {
   // src/constants.js
+  var RELEVANCE_ADMISSION = Object.freeze({
+    fuzzyThreshold: 0.74,
+    relevanceBand: 0.05,
+    singleTerm: Object.freeze({ threshold: 0.45, minCoverage: 1 }),
+    shortQuery: Object.freeze({ threshold: 0.35, minCoverage: 0.5 }),
+    longQuery: Object.freeze({ threshold: 0.3, minCoverage: 0.4 })
+  });
+  var COMMON_RECALL = Object.freeze({
+    threshold: RELEVANCE_ADMISSION.shortQuery.threshold,
+    minCoverage: RELEVANCE_ADMISSION.shortQuery.minCoverage,
+    fuzzyThreshold: RELEVANCE_ADMISSION.fuzzyThreshold,
+    relevanceBand: RELEVANCE_ADMISSION.relevanceBand,
+    orders: Object.freeze(["totalrank", "click", "pubdate", "stow", "dm"]),
+    pagesPerOrder: 3,
+    pageSize: 50
+  });
+  function viewProfile({ id, label, shortDescription, relevanceWeight, signalWeight, qualityWeight }) {
+    return Object.freeze({
+      ...COMMON_RECALL,
+      id,
+      label,
+      shortDescription,
+      relevanceWeight,
+      signalWeight,
+      qualityWeight
+    });
+  }
   var MODE_PROFILES = Object.freeze({
-    strict: Object.freeze({
-      id: "strict",
-      label: "严格",
-      shortDescription: "高覆盖、低容错，优先排除疑似无关内容",
-      threshold: 0.7,
-      minCoverage: 0.75,
-      fuzzyThreshold: 1,
-      relevanceWeight: 0.93,
-      relevanceBand: 0.04,
-      orders: Object.freeze(["totalrank", "click", "pubdate", "stow"]),
-      pagesPerOrder: 2,
-      pageSize: 50
+    quality: viewProfile({
+      id: "quality",
+      label: "长期质量",
+      shortDescription: "优先展示长期累计表现与深度互动更强的内容",
+      relevanceWeight: 0.4,
+      signalWeight: 0.6,
+      qualityWeight: 0
     }),
-    standard: Object.freeze({
-      id: "standard",
-      label: "标准",
-      shortDescription: "相关性优先，在小范围内用质量分调序",
-      threshold: 0.46,
-      minCoverage: 0.5,
-      fuzzyThreshold: 1,
-      relevanceWeight: 0.87,
-      relevanceBand: 0.05,
-      orders: Object.freeze(["totalrank", "click", "pubdate", "stow"]),
-      pagesPerOrder: 2,
-      pageSize: 50
+    growth: viewProfile({
+      id: "growth",
+      label: "增长趋势",
+      shortDescription: "优先展示近期增速更快的内容；无快照时使用低置信度估算",
+      relevanceWeight: 0.35,
+      signalWeight: 0.55,
+      qualityWeight: 0.1
     }),
-    exploration: Object.freeze({
-      id: "exploration",
-      label: "探索",
-      shortDescription: "放宽门槛，并加入弹幕排序以发现长尾内容",
-      threshold: 0.25,
-      minCoverage: 0.25,
-      fuzzyThreshold: 0.7,
-      relevanceWeight: 0.78,
-      relevanceBand: 0.07,
-      orders: Object.freeze(["totalrank", "click", "pubdate", "stow", "dm"]),
-      pagesPerOrder: 3,
-      pageSize: 50
+    timeliness: viewProfile({
+      id: "timeliness",
+      label: "最新热播",
+      shortDescription: "综合发布时间与当前观看热度，质量仅作小幅辅助",
+      relevanceWeight: 0.35,
+      signalWeight: 0.55,
+      qualityWeight: 0.1
     })
   });
-  var DEFAULT_MODE = "standard";
+  var SORT_VIEW_PROFILES = MODE_PROFILES;
+  var DEFAULT_MODE = "quality";
+  var DEFAULT_SORT_VIEW = DEFAULT_MODE;
   var RESULTS_PER_PAGE = 24;
   var CACHE_TTL_MS = 5 * 60 * 1e3;
-  var STORAGE_MODE_KEY = "bps:mode:v1";
+  var STORAGE_MODE_KEY = "bps:sort-view:v2";
   function getModeProfile(mode) {
     return MODE_PROFILES[mode] ?? MODE_PROFILES[DEFAULT_MODE];
   }
@@ -405,6 +419,12 @@
     legacy: "https://api.bilibili.com/x/web-interface/search/type",
     nav: "https://api.bilibili.com/x/web-interface/nav"
   });
+  var DATA_ENDPOINTS = Object.freeze({
+    detail: "https://api.bilibili.com/x/web-interface/view",
+    statFallback: "https://api.bilibili.com/x/web-interface/archive/stat",
+    pageList: "https://api.bilibili.com/x/player/pagelist",
+    online: "https://api.bilibili.com/x/player/online/total"
+  });
   var MIXIN_KEY_ENCODE_TABLE = Object.freeze([
     46,
     47,
@@ -479,6 +499,15 @@
     dm: "弹幕"
   });
   var RISK_CODES = /* @__PURE__ */ new Set([-352, -412, -429, 412, 429]);
+  var STAT_FIELD_MAP = Object.freeze({
+    views: "view",
+    likes: "like",
+    favorites: "favorite",
+    replies: "reply",
+    danmaku: "danmaku",
+    coins: "coin",
+    shares: "share"
+  });
   var BilibiliApiError = class extends Error {
     constructor(message, { code = null, status = null, kind = "api", cause = null } = {}) {
       super(message, cause ? { cause } : void 0);
@@ -511,6 +540,10 @@
     if (value === null || value === void 0 || value === "") return fallback;
     const parsed = typeof value === "string" ? Number(value.replace(/,/g, "")) : Number(value);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  }
+  function searchInteraction(value) {
+    const parsed = safeNumber(value);
+    return parsed === 0 ? null : parsed;
   }
   function httpsUrl(value) {
     const raw = String(value ?? "").trim();
@@ -567,12 +600,12 @@
       },
       stats: {
         views: safeNumber(raw.play),
-        likes: safeNumber(raw.like),
-        favorites: safeNumber(raw.favorites),
+        likes: searchInteraction(raw.like),
+        favorites: searchInteraction(raw.favorites),
         replies: safeNumber(raw.review),
         danmaku: safeNumber(raw.danmaku ?? raw.video_review),
-        coins: safeNumber(raw.coin),
-        shares: safeNumber(raw.share)
+        coins: searchInteraction(raw.coin),
+        shares: searchInteraction(raw.share)
       },
       sources: [{
         order: source.order ?? "unknown",
@@ -580,6 +613,105 @@
         page: source.page ?? 1,
         position: source.position ?? null
       }]
+    };
+  }
+  function normalizeStats(raw) {
+    const stats = {};
+    for (const [target, source] of Object.entries(STAT_FIELD_MAP)) {
+      stats[target] = safeNumber(raw?.[source]);
+    }
+    return stats;
+  }
+  function normalizePageList(rawPages) {
+    if (!Array.isArray(rawPages)) return [];
+    return rawPages.map((raw, index) => {
+      const cid = safeNumber(raw?.cid);
+      if (cid === null) return null;
+      return {
+        cid,
+        page: safeNumber(raw?.page, index + 1),
+        part: stripHtml(raw?.part ?? raw?.title).replace(/\s+/g, " ").trim(),
+        durationSeconds: safeNumber(raw?.duration),
+        dimension: raw?.dimension && typeof raw.dimension === "object" ? {
+          width: safeNumber(raw.dimension.width),
+          height: safeNumber(raw.dimension.height),
+          rotate: safeNumber(raw.dimension.rotate, 0)
+        } : null
+      };
+    }).filter(Boolean);
+  }
+  function normalizeVideoDetail(raw, fallbackBvid = "", source = "detail") {
+    if (!raw || typeof raw !== "object") return null;
+    const bvid = String(raw.bvid ?? fallbackBvid).trim();
+    if (!bvid) return null;
+    const durationSeconds = safeNumber(raw.duration);
+    const publishedSeconds = safeNumber(raw.pubdate);
+    const pages = normalizePageList(raw.pages);
+    return {
+      bvid,
+      aid: safeNumber(raw.aid),
+      title: stripHtml(raw.title).replace(/\s+/g, " ").trim(),
+      description: stripHtml(raw.desc ?? raw.description).replace(/\s+/g, " ").trim(),
+      coverUrl: httpsUrl(raw.pic ?? raw.cover),
+      durationSeconds,
+      durationText: durationLabel(null, durationSeconds),
+      publishedAt: publishedSeconds === null ? null : publishedSeconds * 1e3,
+      author: {
+        name: stripHtml(raw.owner?.name ?? raw.author).trim(),
+        mid: safeNumber(raw.owner?.mid ?? raw.mid),
+        avatarUrl: httpsUrl(raw.owner?.face ?? raw.face)
+      },
+      stats: normalizeStats(raw.stat ?? raw),
+      pages,
+      pageCount: safeNumber(raw.videos, pages.length || null),
+      source,
+      partial: source !== "detail"
+    };
+  }
+  function parseOnlineCount(input) {
+    if (input === null || input === void 0) return { value: null, approximate: false, raw: "" };
+    if (typeof input === "number") {
+      return Number.isFinite(input) && input >= 0 ? { value: Math.round(input), approximate: false, raw: String(input) } : { value: null, approximate: false, raw: String(input) };
+    }
+    const raw = String(input).trim();
+    const match = raw.replace(/,/g, "").match(/^(\d+(?:\.\d+)?)\s*([万亿]?)\s*(\+)?$/);
+    if (!match) return { value: null, approximate: false, raw };
+    const multiplier = match[2] === "亿" ? 1e8 : match[2] === "万" ? 1e4 : 1;
+    const value = Number(match[1]) * multiplier;
+    return {
+      value: Number.isFinite(value) ? Math.round(value) : null,
+      approximate: Boolean(match[2] || match[3]),
+      raw
+    };
+  }
+  function switchEnabled(showSwitch, key) {
+    const value = showSwitch?.[key];
+    if (value === void 0 || value === null) return true;
+    return value === true || value === 1 || value === "1";
+  }
+  function normalizeOnlineStats(raw, context = {}) {
+    if (!raw || typeof raw !== "object") return null;
+    const totalVisible = switchEnabled(raw.show_switch, "total");
+    const webVisible = switchEnabled(raw.show_switch, "count");
+    const total = parseOnlineCount(raw.total);
+    const web = parseOnlineCount(raw.count);
+    return {
+      bvid: context.bvid ?? "",
+      cid: safeNumber(context.cid),
+      // Bilibili requires a cid, so online counts always describe the selected
+      // page/part. Automatic selection uses page 1 and never claims to aggregate
+      // all parts of a multi-P video.
+      scope: "page",
+      selection: context.selection ?? "explicit",
+      page: safeNumber(context.page),
+      part: String(context.part ?? ""),
+      multiPart: Boolean(context.multiPart),
+      total: totalVisible ? total.value : null,
+      web: webVisible ? web.value : null,
+      totalApproximate: totalVisible && total.approximate,
+      webApproximate: webVisible && web.approximate,
+      raw: { total: total.raw, web: web.raw },
+      visible: { total: totalVisible, web: webVisible }
     };
   }
   function pickLonger(left, right) {
@@ -789,13 +921,155 @@
     }
     return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
   }
+  function normalizedBvid(value) {
+    const bvid = String(value ?? "").trim();
+    if (!/^BV[0-9A-Za-z]{8,24}$/.test(bvid)) {
+      throw new BilibiliApiError("无效的 BV 号", { kind: "input" });
+    }
+    return bvid;
+  }
+  function isStructuralEndpointError(error) {
+    return error instanceof BilibiliApiError && (error.kind === "http" && [404, 405].includes(error.status) || error.code === -404);
+  }
+  function cloneVideoForEnrichment(video) {
+    return {
+      ...video,
+      author: { ...video.author ?? {} },
+      stats: { ...video.stats ?? {} },
+      tags: [...video.tags ?? []],
+      sources: [...video.sources ?? []],
+      enrichment: { ...video.enrichment ?? {} }
+    };
+  }
+  function mergeDetailIntoVideo(video, detail) {
+    const merged = cloneVideoForEnrichment(video);
+    if (!detail) {
+      merged.enrichment.detail = "unavailable";
+      return merged;
+    }
+    merged.aid ??= detail.aid;
+    merged.title ||= detail.title;
+    merged.description ||= detail.description;
+    merged.coverUrl ||= detail.coverUrl;
+    merged.durationSeconds ??= detail.durationSeconds;
+    merged.durationText ||= detail.durationText;
+    merged.publishedAt ??= detail.publishedAt;
+    merged.author.name ||= detail.author?.name;
+    merged.author.mid ??= detail.author?.mid;
+    merged.author.avatarUrl ||= detail.author?.avatarUrl;
+    for (const [key, value] of Object.entries(detail.stats ?? {})) {
+      if (value !== null && value !== void 0) merged.stats[key] = value;
+    }
+    merged.pages = [...detail.pages ?? []];
+    merged.enrichment = {
+      ...merged.enrichment,
+      detail: detail.partial ? "partial" : "complete",
+      detailSource: detail.source,
+      pageCount: detail.pageCount
+    };
+    return merged;
+  }
+  async function runPool(items, worker, { signal, concurrency = 2, onProgress } = {}) {
+    ensureNotAborted(signal);
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const results = /* @__PURE__ */ new Map();
+    const errors = [];
+    let cursor = 0;
+    let completed = 0;
+    let fatalError = null;
+    const run = async () => {
+      while (!controller.signal.aborted && cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        const item = items[index];
+        try {
+          const value = await worker(item, controller.signal, index);
+          results.set(item, value);
+        } catch (error) {
+          if (error?.kind === "risk" || error?.kind === "signature") {
+            fatalError ??= error;
+            controller.abort();
+            break;
+          }
+          if (error?.name === "AbortError") {
+            if (signal?.aborted) break;
+            if (controller.signal.aborted) break;
+          } else {
+            errors.push({ item, message: error?.message ?? String(error), kind: error?.kind ?? "unknown" });
+          }
+        } finally {
+          completed += 1;
+          onProgress?.({ completed, total: items.length, item });
+        }
+      }
+    };
+    try {
+      await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, () => run()));
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
+    if (fatalError) throw fatalError;
+    if (signal?.aborted) throw abortError();
+    return { results, errors, completed };
+  }
   var BilibiliSearchApiAdapter = class {
-    constructor({ request = createDefaultRequest(), now = () => Date.now(), random = Math.random } = {}) {
+    constructor({
+      request = createDefaultRequest(),
+      now = () => Date.now(),
+      random = Math.random,
+      detailTtl = 30 * 60 * 1e3,
+      pageTtl = 30 * 60 * 1e3,
+      onlineTtl = 45 * 1e3,
+      enrichmentDelayMs = 80
+    } = {}) {
       this.request = request;
       this.now = now;
       this.random = random;
+      this.detailTtl = detailTtl;
+      this.pageTtl = pageTtl;
+      this.onlineTtl = onlineTtl;
+      this.enrichmentDelayMs = enrichmentDelayMs;
       this.wbiCache = null;
       this.wbiPending = null;
+      this.detailCache = /* @__PURE__ */ new Map();
+      this.detailPending = /* @__PURE__ */ new Map();
+      this.pageCache = /* @__PURE__ */ new Map();
+      this.pagePending = /* @__PURE__ */ new Map();
+      this.onlineCache = /* @__PURE__ */ new Map();
+      this.onlinePending = /* @__PURE__ */ new Map();
+    }
+    async readThrough(cache, pending, key, ttl, loader, { signal, force = false } = {}) {
+      ensureNotAborted(signal);
+      const cached = cache.get(key);
+      if (!force && cached && cached.expiresAt > this.now()) return cached.value;
+      if (force) cache.delete(key);
+      let entry = pending.get(key);
+      if (!entry) {
+        const controller = new AbortController();
+        entry = { controller, waiters: 0, settled: false, promise: null };
+        entry.promise = Promise.resolve().then(() => loader(controller.signal)).then((value) => {
+          cache.set(key, { value, expiresAt: this.now() + ttl });
+          return value;
+        }).finally(() => {
+          entry.settled = true;
+          if (pending.get(key) === entry) pending.delete(key);
+        });
+        pending.set(key, entry);
+      }
+      entry.waiters += 1;
+      try {
+        return await waitForSharedPromise(entry.promise, signal);
+      } finally {
+        entry.waiters -= 1;
+        if (!entry.settled && entry.waiters === 0) entry.controller.abort();
+      }
+    }
+    clearEnrichmentCache() {
+      this.detailCache.clear();
+      this.pageCache.clear();
+      this.onlineCache.clear();
     }
     async getWbiKeys(signal) {
       if (this.wbiCache && this.wbiCache.expiresAt > this.now()) return this.wbiCache.keys;
@@ -886,6 +1160,253 @@
         hasNext: payload?.data?.next !== 0 && (safeNumber(payload?.data?.numPages) === null || page < safeNumber(payload?.data?.numPages))
       };
     }
+    async getVideoDetail(bvidValue, { signal, force = false } = {}) {
+      const bvid = normalizedBvid(bvidValue);
+      return this.readThrough(
+        this.detailCache,
+        this.detailPending,
+        bvid,
+        this.detailTtl,
+        async (requestSignal) => {
+          const detailUrl = `${DATA_ENDPOINTS.detail}?${plainQuery({ bvid })}`;
+          let payload;
+          try {
+            payload = validatePayload(await this.request(detailUrl, { signal: requestSignal }));
+            const detail = normalizeVideoDetail(payload?.data, bvid, "detail");
+            if (detail) return detail;
+          } catch (error) {
+            if (!isStructuralEndpointError(error)) throw error;
+          }
+          const fallbackUrl = `${DATA_ENDPOINTS.statFallback}?${plainQuery({ bvid })}`;
+          const fallbackPayload = validatePayload(await this.request(fallbackUrl, { signal: requestSignal }));
+          const fallback = normalizeVideoDetail(fallbackPayload?.data, bvid, "stat-fallback");
+          if (!fallback) throw new BilibiliApiError("B站未返回视频详情", { kind: "data" });
+          return fallback;
+        },
+        { signal, force }
+      );
+    }
+    async getVideoCards(bvidValues, {
+      signal,
+      batchSize = 12,
+      concurrency = 2,
+      maxItems = 60,
+      force = false,
+      onProgress
+    } = {}) {
+      ensureNotAborted(signal);
+      const unique = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const value of bvidValues ?? []) {
+        const bvid = normalizedBvid(value);
+        if (!seen.has(bvid)) {
+          seen.add(bvid);
+          unique.push(bvid);
+        }
+      }
+      const limited = unique.slice(0, Math.max(0, maxItems));
+      const skipped = unique.slice(limited.length);
+      const size = Math.min(20, Math.max(10, Math.round(batchSize)));
+      const cards = /* @__PURE__ */ new Map();
+      const errors = [];
+      let completed = 0;
+      for (let offset = 0; offset < limited.length; offset += size) {
+        ensureNotAborted(signal);
+        const chunk = limited.slice(offset, offset + size);
+        const pooled = await runPool(chunk, async (bvid, poolSignal, index) => {
+          if (offset + index > 0 && this.enrichmentDelayMs > 0) {
+            await sleep(this.enrichmentDelayMs + Math.floor(this.random() * this.enrichmentDelayMs), poolSignal);
+          }
+          return this.getVideoDetail(bvid, { signal: poolSignal, force });
+        }, {
+          signal,
+          concurrency: Math.min(3, Math.max(1, concurrency)),
+          onProgress: ({ item }) => {
+            completed += 1;
+            onProgress?.({ phase: "detail", completed, total: limited.length, bvid: item });
+          }
+        });
+        for (const [bvid, card] of pooled.results) cards.set(bvid, card);
+        errors.push(...pooled.errors.map((error) => ({ bvid: error.item, ...error })));
+      }
+      return {
+        cards,
+        videos: limited.map((bvid) => cards.get(bvid)).filter(Boolean),
+        errors,
+        requestedCount: limited.length,
+        enrichedCount: cards.size,
+        skippedBvids: skipped
+      };
+    }
+    async getPageList(bvidValue, { signal, force = false } = {}) {
+      const bvid = normalizedBvid(bvidValue);
+      const detailCached = this.detailCache.get(bvid);
+      if (!force && detailCached?.expiresAt > this.now() && detailCached.value?.pages?.length) {
+        return detailCached.value.pages;
+      }
+      return this.readThrough(
+        this.pageCache,
+        this.pagePending,
+        bvid,
+        this.pageTtl,
+        async (requestSignal) => {
+          const url = `${DATA_ENDPOINTS.pageList}?${plainQuery({ bvid, jsonp: "jsonp" })}`;
+          try {
+            const payload = validatePayload(await this.request(url, { signal: requestSignal }));
+            const pages = normalizePageList(payload?.data);
+            if (pages.length) return pages;
+          } catch (error) {
+            if (!isStructuralEndpointError(error)) throw error;
+          }
+          const detail = await this.getVideoDetail(bvid, { signal: requestSignal, force });
+          if (!detail.pages.length) throw new BilibiliApiError("B站未返回分P信息", { kind: "data" });
+          return detail.pages;
+        },
+        { signal, force }
+      );
+    }
+    async getOnline(bvidValue, {
+      cid: cidValue = null,
+      page = 1,
+      part = "",
+      multiPart = null,
+      signal,
+      force = false
+    } = {}) {
+      const bvid = normalizedBvid(bvidValue);
+      let cid = safeNumber(cidValue);
+      let pageNumber = safeNumber(page, 1);
+      let partName = String(part ?? "");
+      let isMultiPart = Boolean(multiPart);
+      let selection = "explicit";
+      if (cid === null) {
+        const pages = await this.getPageList(bvid, { signal });
+        const requestedPage = pageNumber;
+        const requested = pages.find((entry) => entry.page === requestedPage);
+        const selected = requested ?? pages[0];
+        if (!selected) throw new BilibiliApiError("无法确定在线人数对应的分P", { kind: "data" });
+        cid = selected.cid;
+        pageNumber = selected.page;
+        partName = selected.part;
+        isMultiPart = pages.length > 1;
+        selection = requested ? selected.page === 1 ? "first-page" : "requested-page" : "first-page-fallback";
+      }
+      const key = `${bvid}:${cid}`;
+      const rawOnline = await this.readThrough(
+        this.onlineCache,
+        this.onlinePending,
+        key,
+        this.onlineTtl,
+        async (requestSignal) => {
+          const url = `${DATA_ENDPOINTS.online}?${plainQuery({ bvid, cid })}`;
+          const payload = validatePayload(await this.request(url, { signal: requestSignal }));
+          if (!payload?.data || typeof payload.data !== "object") {
+            throw new BilibiliApiError("B站未返回在线人数", { kind: "data" });
+          }
+          return payload.data;
+        },
+        { signal, force }
+      );
+      return normalizeOnlineStats(rawOnline, {
+        bvid,
+        cid,
+        page: pageNumber,
+        part: partName,
+        multiPart: isMultiPart,
+        selection
+      });
+    }
+    async getOnlineForVideos(videos, {
+      signal,
+      limit = 24,
+      concurrency = 2,
+      force = false,
+      onProgress
+    } = {}) {
+      const seen = /* @__PURE__ */ new Set();
+      const targets = (videos ?? []).filter((video) => {
+        if (!video?.bvid || seen.has(video.bvid)) return false;
+        seen.add(video.bvid);
+        return true;
+      }).slice(0, Math.max(0, limit));
+      const pooled = await runPool(targets, async (video, poolSignal, index) => {
+        if (index > 0 && this.enrichmentDelayMs > 0) {
+          await sleep(this.enrichmentDelayMs + Math.floor(this.random() * this.enrichmentDelayMs), poolSignal);
+        }
+        const firstPage = video.pages?.[0];
+        return this.getOnline(video.bvid, {
+          cid: firstPage?.cid,
+          page: firstPage?.page ?? 1,
+          part: firstPage?.part ?? "",
+          multiPart: (video.pages?.length ?? 0) > 1,
+          signal: poolSignal,
+          force
+        });
+      }, {
+        signal,
+        concurrency: Math.min(2, Math.max(1, concurrency)),
+        onProgress: ({ completed, total, item }) => onProgress?.({
+          phase: "online",
+          completed,
+          total,
+          bvid: item?.bvid
+        })
+      });
+      const onlineByBvid = /* @__PURE__ */ new Map();
+      for (const [video, online] of pooled.results) onlineByBvid.set(video.bvid, online);
+      return {
+        onlineByBvid,
+        errors: pooled.errors.map((error) => ({ bvid: error.item?.bvid, ...error })),
+        requestedCount: targets.length,
+        enrichedCount: onlineByBvid.size
+      };
+    }
+    async enrichStats(videos, {
+      signal,
+      detailLimit = 60,
+      includeOnline = false,
+      onlineLimit = 24,
+      onProgress
+    } = {}) {
+      ensureNotAborted(signal);
+      const cloned = (videos ?? []).map(cloneVideoForEnrichment);
+      const eligibleBvids = cloned.map((video) => video?.bvid).filter(Boolean).slice(0, detailLimit);
+      const details = await this.getVideoCards(eligibleBvids, {
+        signal,
+        maxItems: detailLimit,
+        onProgress
+      });
+      const enriched = cloned.map((video) => mergeDetailIntoVideo(video, details.cards.get(video.bvid)));
+      const errors = [...details.errors];
+      let onlineEnrichedCount = 0;
+      let onlineByBvid = /* @__PURE__ */ new Map();
+      if (includeOnline) {
+        const onlineResult = await this.getOnlineForVideos(enriched, {
+          signal,
+          limit: onlineLimit,
+          onProgress
+        });
+        onlineByBvid = onlineResult.onlineByBvid;
+        for (const video of enriched) {
+          const online = onlineByBvid.get(video.bvid);
+          if (online) {
+            video.online = online;
+            video.enrichment.online = "complete";
+            onlineEnrichedCount += 1;
+          }
+        }
+        errors.push(...onlineResult.errors);
+      }
+      return {
+        videos: enriched,
+        enrichedVideos: enriched,
+        onlineByBvid,
+        errors,
+        detailEnrichedCount: details.enrichedCount,
+        onlineEnrichedCount,
+        skippedBvids: details.skippedBvids
+      };
+    }
     async collectCandidates(keyword, profile, { signal, onProgress } = {}) {
       const orders = [...profile.orders];
       const qvId = randomId();
@@ -966,7 +1487,103 @@
     }
   };
 
+  // src/metric-history.js
+  var DEFAULT_STORAGE_KEY = "bps:metric-history:v1";
+  var DEFAULT_MAX_VIDEOS = 240;
+  var DEFAULT_MAX_SNAPSHOTS = 16;
+  var DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1e3;
+  var DEFAULT_MIN_INTERVAL_MS = 30 * 60 * 1e3;
+  var METRIC_KEYS = ["views", "likes", "favorites", "coins", "replies", "danmaku", "shares"];
+  function finiteMetric(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+  }
+  function compactStats(stats = {}) {
+    return Object.fromEntries(METRIC_KEYS.map((key) => [key, finiteMetric(stats[key])]));
+  }
+  function validSnapshot(snapshot) {
+    return snapshot && Number.isFinite(Number(snapshot.capturedAt)) && snapshot.stats && typeof snapshot.stats === "object";
+  }
+  var MetricHistoryStore = class {
+    constructor({
+      storage = globalThis.localStorage,
+      storageKey = DEFAULT_STORAGE_KEY,
+      now = () => Date.now(),
+      maxVideos = DEFAULT_MAX_VIDEOS,
+      maxSnapshots = DEFAULT_MAX_SNAPSHOTS,
+      maxAgeMs = DEFAULT_MAX_AGE_MS,
+      minIntervalMs = DEFAULT_MIN_INTERVAL_MS
+    } = {}) {
+      this.storage = storage;
+      this.storageKey = storageKey;
+      this.now = now;
+      this.maxVideos = maxVideos;
+      this.maxSnapshots = maxSnapshots;
+      this.maxAgeMs = maxAgeMs;
+      this.minIntervalMs = minIntervalMs;
+      this.memory = { version: 1, videos: {} };
+    }
+    load() {
+      let parsed = this.memory;
+      try {
+        const raw = this.storage?.getItem(this.storageKey);
+        if (raw) parsed = JSON.parse(raw);
+      } catch {
+      }
+      if (!parsed || parsed.version !== 1 || !parsed.videos || typeof parsed.videos !== "object") {
+        parsed = { version: 1, videos: {} };
+      }
+      this.memory = parsed;
+      return parsed;
+    }
+    save(data) {
+      this.memory = data;
+      try {
+        this.storage?.setItem(this.storageKey, JSON.stringify(data));
+      } catch {
+      }
+    }
+    snapshotsFor(videos = []) {
+      const data = this.load();
+      const cutoff = this.now() - this.maxAgeMs;
+      const result = /* @__PURE__ */ new Map();
+      for (const video of videos) {
+        const bvid = String(video?.bvid ?? video?.key ?? "").trim();
+        if (!bvid) continue;
+        const snapshots = Array.isArray(data.videos[bvid]?.snapshots) ? data.videos[bvid].snapshots.filter(validSnapshot).filter((snapshot) => Number(snapshot.capturedAt) >= cutoff).sort((left, right) => Number(left.capturedAt) - Number(right.capturedAt)) : [];
+        result.set(bvid, snapshots);
+      }
+      return result;
+    }
+    record(videos = []) {
+      const capturedAt = this.now();
+      const cutoff = capturedAt - this.maxAgeMs;
+      const data = this.load();
+      for (const video of videos) {
+        const bvid = String(video?.bvid ?? video?.key ?? "").trim();
+        if (!bvid || !video?.stats) continue;
+        const stats = compactStats(video.stats);
+        if (!METRIC_KEYS.some((key) => stats[key] !== null)) continue;
+        const previous = Array.isArray(data.videos[bvid]?.snapshots) ? data.videos[bvid].snapshots.filter(validSnapshot) : [];
+        const snapshots = previous.filter((snapshot) => Number(snapshot.capturedAt) >= cutoff).sort((left, right) => Number(left.capturedAt) - Number(right.capturedAt));
+        const last = snapshots.at(-1);
+        if (last && capturedAt - Number(last.capturedAt) < this.minIntervalMs) continue;
+        snapshots.push({ capturedAt, stats });
+        data.videos[bvid] = {
+          updatedAt: capturedAt,
+          snapshots: snapshots.slice(-this.maxSnapshots)
+        };
+      }
+      const retained = Object.entries(data.videos).filter(([, entry]) => Number(entry?.updatedAt) >= cutoff).sort((left, right) => Number(right[1]?.updatedAt) - Number(left[1]?.updatedAt)).slice(0, this.maxVideos);
+      data.videos = Object.fromEntries(retained);
+      this.save(data);
+    }
+  };
+
   // src/scoring.js
+  var DAY_MS = 864e5;
+  var HOUR_MS = 36e5;
+  var MIN_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1e3;
   var FIELD_DEFINITIONS = Object.freeze([
     Object.freeze({ id: "title", label: "标题", strength: 1 }),
     Object.freeze({ id: "tags", label: "标签", strength: 0.78 }),
@@ -975,6 +1592,7 @@
     Object.freeze({ id: "category", label: "分区", strength: 0.28 })
   ]);
   var CORE_FIELDS = /* @__PURE__ */ new Set(["title", "tags", "description"]);
+  var TITLE_OR_TAG_FIELDS = /* @__PURE__ */ new Set(["title", "tags"]);
   var VERSION_QUALIFIERS = /* @__PURE__ */ new Set([
     "pro",
     "max",
@@ -1002,18 +1620,31 @@
     "代"
   ]);
   var QUALITY_METRICS = Object.freeze([
-    Object.freeze({ id: "views", label: "播放", weight: 0.16, rate: false }),
-    Object.freeze({ id: "likes", label: "点赞", weight: 0.2, rate: true }),
-    Object.freeze({ id: "favorites", label: "收藏", weight: 0.18, rate: true }),
-    Object.freeze({ id: "coins", label: "投币", weight: 0.16, rate: true }),
-    Object.freeze({ id: "replies", label: "评论", weight: 0.09, rate: true }),
-    Object.freeze({ id: "danmaku", label: "弹幕", weight: 0.07, rate: true })
+    Object.freeze({ id: "favorites", label: "收藏", weight: 0.25, anchor: 2e3, baseRate: 0.012 }),
+    Object.freeze({ id: "coins", label: "投币", weight: 0.2, anchor: 1e3, baseRate: 6e-3 }),
+    Object.freeze({ id: "shares", label: "分享", weight: 0.15, anchor: 500, baseRate: 2e-3 }),
+    Object.freeze({ id: "likes", label: "点赞", weight: 0.15, anchor: 5e3, baseRate: 0.035 }),
+    Object.freeze({ id: "replies", label: "评论", weight: 0.1, anchor: 300, baseRate: 2e-3 }),
+    Object.freeze({ id: "views", label: "播放", weight: 0.1, anchor: 1e5, baseRate: null }),
+    Object.freeze({ id: "danmaku", label: "弹幕", weight: 0.05, anchor: 1e3, baseRate: 6e-3 })
+  ]);
+  var GROWTH_METRICS = Object.freeze([
+    Object.freeze({ id: "views", label: "播放", weight: 0.25, dailyAnchor: 1e5 }),
+    Object.freeze({ id: "likes", label: "点赞", weight: 0.2, dailyAnchor: 5e3 }),
+    Object.freeze({ id: "favorites", label: "收藏", weight: 0.18, dailyAnchor: 2e3 }),
+    Object.freeze({ id: "coins", label: "投币", weight: 0.14, dailyAnchor: 1e3 }),
+    Object.freeze({ id: "shares", label: "分享", weight: 0.08, dailyAnchor: 500 }),
+    Object.freeze({ id: "replies", label: "评论", weight: 0.07, dailyAnchor: 300 }),
+    Object.freeze({ id: "danmaku", label: "弹幕", weight: 0.08, dailyAnchor: 1e3 })
   ]);
   function clamp(value, min = 0, max = 1) {
     return Math.min(max, Math.max(min, value));
   }
-  function weightedSum(items) {
-    return items.reduce((sum, item) => sum + item.value * item.weight, 0);
+  function weightedAverage(items, valueKey = "value") {
+    const available = items.filter((item) => Number.isFinite(item[valueKey]) && item.weight > 0);
+    const weight = available.reduce((sum, item) => sum + item.weight, 0);
+    if (!weight) return null;
+    return available.reduce((sum, item) => sum + item[valueKey] * item.weight, 0) / weight;
   }
   function fieldText(video, fieldId) {
     if (fieldId === "tags") return (video.tags ?? []).join(" ");
@@ -1040,15 +1671,15 @@
     return new RegExp(`(^|${leftBoundary})${escaped}([^a-z0-9]|$)`, "i").test(compact);
   }
   function matchTermInField(term, text, profile) {
-    if (!text) return { confidence: 0, exact: false, fuzzy: false };
-    if (hasExactTerm(text, term)) return { confidence: 1, exact: true, fuzzy: false };
+    if (!text) return { confidence: 0, exact: false, fuzzy: false, similarity: 0 };
+    if (hasExactTerm(text, term)) return { confidence: 1, exact: true, fuzzy: false, similarity: 1 };
     const shortAscii = /^[a-z]+$/i.test(term.compact) && term.compact.length < 5;
-    if (profile.fuzzyThreshold >= 1 || /^\d+$/.test(term.compact) || term.compact.length < 3 || shortAscii) {
-      return { confidence: 0, exact: false, fuzzy: false };
+    if (/^\d+$/.test(term.compact) || term.compact.length < 3 || shortAscii) {
+      return { confidence: 0, exact: false, fuzzy: false, similarity: 0 };
     }
     const similarity = bestSubstringSimilarity(term.compact, text);
-    if (similarity < profile.fuzzyThreshold) return { confidence: 0, exact: false, fuzzy: false };
-    return { confidence: similarity * 0.82, exact: false, fuzzy: true };
+    if (similarity < profile.fuzzyThreshold) return { confidence: 0, exact: false, fuzzy: false, similarity };
+    return { confidence: similarity * 0.82, exact: false, fuzzy: true, similarity };
   }
   function phraseDetails(parsedQuery, video) {
     const author = compactText(video.author?.name);
@@ -1086,11 +1717,12 @@
     const end = Math.max(...positions.map((item) => item.position + item.length));
     return clamp(matchedLength / Math.max(1, end - start) * (positions.length / parsedQuery.terms.length));
   }
-  function exactPhrasePasses(parsedQuery, video, mode) {
+  function exactPhrasePasses(parsedQuery, video) {
     if (parsedQuery.exactPhrases.length === 0) return true;
-    const fieldIds = mode === "strict" ? ["title", "tags"] : ["title", "tags", "description", "author"];
     return parsedQuery.exactPhrases.every(
-      (phrase) => fieldIds.some((fieldId) => hasExactTerm(fieldText(video, fieldId), { text: normalizeText(phrase), compact: compactText(phrase) }))
+      (phrase) => ["title", "tags", "description", "author"].some(
+        (fieldId) => hasExactTerm(fieldText(video, fieldId), { text: normalizeText(phrase), compact: compactText(phrase) })
+      )
     );
   }
   function negativeMatch(parsedQuery, video) {
@@ -1103,15 +1735,21 @@
     ].join(" ");
     return parsedQuery.negativeTerms.find((term) => hasExactTerm(searchable, term)) ?? null;
   }
-  function modelTermPasses(matchedTerms, mode) {
-    const modelTerms = matchedTerms.filter((item) => /\d/.test(item.term));
-    const qualifiers = matchedTerms.filter((item) => VERSION_QUALIFIERS.has(item.term.toLocaleLowerCase()));
-    if (modelTerms.length === 0 && qualifiers.length === 0) return true;
-    const required = [...modelTerms, ...qualifiers];
+  function modelTermPasses(matchedTerms) {
+    const required = matchedTerms.filter(
+      (item) => /\d/.test(item.term) || VERSION_QUALIFIERS.has(item.term.toLocaleLowerCase())
+    );
     return required.every((item) => item.matches.some((match) => match.exact && CORE_FIELDS.has(match.field)));
   }
-  function scoreRelevance(video, queryOrParsed, mode = "standard") {
-    const profile = getModeProfile(mode);
+  function resolveAdmissionRules(parsedQuery) {
+    const primaryCount = parsedQuery.terms.filter((term) => !term.auxiliary).length;
+    const auxiliaryCount = parsedQuery.terms.length - primaryCount;
+    const effectiveTermCount = primaryCount === 1 && auxiliaryCount >= 3 ? Math.min(4, 1 + Math.ceil(auxiliaryCount / 3)) : Math.max(1, primaryCount);
+    const base = effectiveTermCount === 1 ? RELEVANCE_ADMISSION.singleTerm : effectiveTermCount <= 3 ? RELEVANCE_ADMISSION.shortQuery : RELEVANCE_ADMISSION.longQuery;
+    return { ...base, effectiveTermCount };
+  }
+  function scoreRelevance(video, queryOrParsed, view = "quality") {
+    const profile = getModeProfile(view);
     const parsedQuery = typeof queryOrParsed === "string" ? parseQuery(queryOrParsed) : queryOrParsed;
     if (!parsedQuery?.terms?.length) {
       return {
@@ -1119,6 +1757,7 @@
         coverage: 0,
         titleCoverage: 0,
         passes: false,
+        admission: { threshold: 1, minCoverage: 1, effectiveTermCount: 0 },
         matchedTerms: [],
         missingTerms: [],
         positiveReasons: [],
@@ -1165,17 +1804,29 @@
     );
     const missingTerms = matchedTerms.filter((item) => item.matches.length === 0 && !item.auxiliary).map((item) => item.term);
     const negative = negativeMatch(parsedQuery, video);
-    const phrasePass = exactPhrasePasses(parsedQuery, video, mode);
-    const modelPass = authorExact && mode !== "strict" ? true : modelTermPasses(matchedTerms, mode);
-    const hasTitleOrTag = matchedTerms.some((item) => item.matches.some((match) => match.field === "title" || match.field === "tags"));
-    const descriptionPhraseException = phrase.field === "description" && phrase.score >= 0.65;
-    const corePass = mode === "strict" ? titleCoverage >= 0.45 : mode === "standard" ? hasTitleOrTag || descriptionPhraseException || authorExact : coreCoverage > 0 || authorExact;
+    const phrasePass = exactPhrasePasses(parsedQuery, video);
+    const modelPass = authorExact || modelTermPasses(matchedTerms);
+    const primaryTerms = matchedTerms.filter((item) => !item.auxiliary);
+    const hasExactTitleOrTag = primaryTerms.some(
+      (item) => item.matches.some((match) => match.exact && TITLE_OR_TAG_FIELDS.has(match.field))
+    );
+    const hasStrongSingleTermFuzzyAnchor = primaryTerms.length === 1 && primaryTerms[0].compact.length >= 5 && primaryTerms[0].matches.some(
+      (match) => match.fuzzy && TITLE_OR_TAG_FIELDS.has(match.field) && match.similarity >= 0.85
+    );
+    const exactAuxiliaryAnchors = matchedTerms.filter((item) => item.auxiliary && item.matches.some(
+      (match) => match.exact && TITLE_OR_TAG_FIELDS.has(match.field)
+    )).length;
+    const hasCjkBigramAnchor = primaryTerms.length === 1 && parsedQuery.terms.some((term) => term.auxiliary) && exactAuxiliaryAnchors >= 2;
+    const corePass = hasExactTitleOrTag || authorExact || hasStrongSingleTermFuzzyAnchor || hasCjkBigramAnchor;
+    const admission = resolveAdmissionRules(parsedQuery);
+    if (admission.effectiveTermCount === 1 && !hasExactTitleOrTag && hasStrongSingleTermFuzzyAnchor) {
+      admission.minCoverage = 0.7;
+    }
     const rejectionReasons = [];
     if (negative) rejectionReasons.push(`命中排除词“${negative.text}”`);
-    if (value < profile.threshold) rejectionReasons.push(`相关性低于 ${Math.round(profile.threshold * 100)} 分`);
-    if (coverage < profile.minCoverage) rejectionReasons.push(`关键词覆盖低于 ${Math.round(profile.minCoverage * 100)}%`);
-    if (!corePass) rejectionReasons.push(mode === "strict" ? "严格模式要求标题覆盖主要关键词" : "标题、标签或简介缺少核心命中");
-    if (mode === "strict" && missingTerms.length) rejectionReasons.push("严格模式要求全部关键词命中");
+    if (value < admission.threshold) rejectionReasons.push(`相关性低于 ${Math.round(admission.threshold * 100)} 分`);
+    if (coverage < admission.minCoverage) rejectionReasons.push(`关键词覆盖低于 ${Math.round(admission.minCoverage * 100)}%`);
+    if (!corePass) rejectionReasons.push("至少一个核心词须精确命中标题或标签");
     if (!phrasePass) rejectionReasons.push("引号中的短语未精确命中允许字段");
     if (!modelPass) rejectionReasons.push("数字、年份或型号词未在核心字段精确命中");
     const positiveReasons = [];
@@ -1188,13 +1839,14 @@
     if (missingTerms.length) negativeReasons.push(`未命中：${missingTerms.join("、")}`);
     const nonTitleTerms = matchedTerms.filter((item) => item.matches.length > 0 && !item.matches.some((match) => match.field === "title")).map((item) => item.term);
     if (nonTitleTerms.length) negativeReasons.push(`仅在非标题字段命中：${nonTitleTerms.join("、")}`);
-    if (matchedTerms.some((item) => item.matches.some((match) => match.fuzzy))) negativeReasons.push("包含探索模式的近似匹配");
+    if (matchedTerms.some((item) => item.matches.some((match) => match.fuzzy))) negativeReasons.push("包含有限近似匹配");
     return {
       value,
       coverage,
       coreCoverage,
       titleCoverage,
       phrase,
+      admission,
       passes: rejectionReasons.length === 0,
       matchedTerms: matchedTerms.filter((item) => item.matches.length > 0 && !item.auxiliary).map((item) => ({
         term: item.term,
@@ -1208,156 +1860,276 @@
       rejectionReasons
     };
   }
-  function median(values) {
-    if (!values.length) return 0;
-    const sorted = [...values].sort((a, b) => a - b);
-    const middle = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  function validStat(videoOrStats, metricId) {
+    const stats = videoOrStats?.stats ?? videoOrStats;
+    const value = stats?.[metricId];
+    if (value === null || value === void 0 || value === "" || !Number.isFinite(Number(value))) return null;
+    return Math.max(0, Number(value));
   }
-  function percentile(sortedValues, value) {
-    if (!sortedValues.length || !Number.isFinite(value)) return 0.5;
-    let below = 0;
-    let equal = 0;
-    for (const candidate of sortedValues) {
-      if (candidate < value) below += 1;
-      else if (candidate === value) equal += 1;
-    }
-    const midrank = (below + 0.5 * equal) / sortedValues.length;
-    const confidence = Math.min(1, sortedValues.length / 25);
-    return clamp(0.5 + (midrank - 0.5) * confidence);
+  function sigmoidLog(value, anchor, steepness = 1.15) {
+    if (!Number.isFinite(value) || value < 0 || !Number.isFinite(anchor) || anchor <= 0) return null;
+    const logRatio = Math.log((value + 1) / (anchor + 1));
+    return clamp(1 / (1 + Math.exp(-steepness * logRatio)));
   }
-  function ageDays(video, now) {
-    const publishedAt = Number(video.publishedAt);
-    if (!Number.isFinite(publishedAt) || publishedAt <= 0) return null;
-    return Math.max(0, (now - publishedAt) / 864e5);
-  }
-  function validStat(video, metricId) {
-    const value = video.stats?.[metricId];
-    return value === null || value === void 0 || !Number.isFinite(Number(value)) ? null : Math.max(0, Number(value));
-  }
-  function qualityContext(videos, now) {
-    const categoryCounts = /* @__PURE__ */ new Map();
-    for (const video of videos) {
-      const key = video.category || "未分区";
-      categoryCounts.set(key, (categoryCounts.get(key) ?? 0) + 1);
-    }
-    const contextKey = (video) => categoryCounts.get(video.category || "未分区") >= 25 ? video.category || "未分区" : "__all__";
-    const groups = /* @__PURE__ */ new Map([["__all__", videos]]);
-    for (const [category, count] of categoryCounts) {
-      if (count >= 25) groups.set(category, videos.filter((video) => (video.category || "未分区") === category));
-    }
-    const prepared = /* @__PURE__ */ new Map();
-    for (const [key, members] of groups) {
-      const viewValues = members.map((video) => validStat(video, "views")).filter((value) => value !== null);
-      const priorViews = clamp(median(viewValues) * 0.02, 500, 1e4);
-      const metrics = {};
-      for (const metric of QUALITY_METRICS) {
-        const rows = members.map((video) => {
-          const count = validStat(video, metric.id);
-          const views = validStat(video, "views");
-          const age = ageDays(video, now);
-          return { video, count, views, age };
-        }).filter((row) => row.count !== null);
-        const rates = metric.rate ? rows.filter((row) => row.views !== null).map((row) => row.count / Math.max(row.views, row.count, 1)) : [];
-        const baseRate = median(rates);
-        const values = rows.map((row) => {
-          const velocityDivisor = Math.pow((row.age ?? 365) + 7, 0.35);
-          const countLog = Math.log1p(row.count);
-          const velocityLog = Math.log1p(row.count / velocityDivisor);
-          const rate = metric.rate && row.views !== null ? (row.count + priorViews * baseRate) / (Math.max(row.views, row.count, 1) + priorViews) : null;
-          return { video: row.video, countLog, velocityLog, rate };
-        });
-        metrics[metric.id] = {
-          values,
-          countLogs: values.map((item) => item.countLog).sort((a, b) => a - b),
-          velocityLogs: values.map((item) => item.velocityLog).sort((a, b) => a - b),
-          rates: values.map((item) => item.rate).filter((value) => value !== null).sort((a, b) => a - b)
-        };
+  function scoreOneQuality(video) {
+    const views = validStat(video, "views");
+    const components = QUALITY_METRICS.map((metric) => {
+      const count = validStat(video, metric.id);
+      if (count === null) return { ...metric, value: null, countSignal: null, rateSignal: null };
+      const countSignal = sigmoidLog(count, metric.anchor);
+      let rateSignal = null;
+      if (metric.baseRate !== null && views !== null) {
+        const priorViews = 2e3;
+        const denominator = Math.max(views, count, 0) + priorViews;
+        const smoothedRate = (count + priorViews * metric.baseRate) / Math.max(1, denominator);
+        rateSignal = clamp(smoothedRate / (smoothedRate + metric.baseRate));
       }
-      prepared.set(key, metrics);
-    }
-    const globalMetrics = prepared.get("__all__");
-    for (const [key, metrics] of prepared) {
-      if (key === "__all__") continue;
-      for (const metric of QUALITY_METRICS) {
-        if (metrics[metric.id].values.length < 25) metrics[metric.id] = globalMetrics[metric.id];
-      }
-    }
-    return { contextKey, prepared };
+      return { ...metric, value: countSignal, count, countSignal, rateSignal };
+    });
+    const absolute = weightedAverage(components, "countSignal") ?? 0.5;
+    const rateComponents = components.filter((component) => component.baseRate !== null);
+    const rate = weightedAverage(rateComponents, "rateSignal") ?? 0.5;
+    const absoluteCompleteness = components.filter((component) => component.countSignal !== null).reduce((sum, component) => sum + component.weight, 0);
+    const totalRateWeight = rateComponents.reduce((sum, component) => sum + component.weight, 0);
+    const rateCompleteness = totalRateWeight ? rateComponents.filter((component) => component.rateSignal !== null).reduce((sum, component) => sum + component.weight, 0) / totalRateWeight : 0;
+    const completeness = clamp(0.65 * absoluteCompleteness + 0.35 * rateCompleteness);
+    const raw = 0.65 * absolute + 0.35 * rate;
+    const value = clamp(0.5 + (raw - 0.5) * (0.35 + 0.65 * completeness));
+    const strongest = components.filter((component) => component.countSignal !== null).sort((left, right) => (right.countSignal ?? 0) - (left.countSignal ?? 0)).slice(0, 2);
+    const positiveReasons = strongest.filter((component) => component.countSignal >= 0.68).map((component) => `${component.label}长期累计表现突出`);
+    const negativeReasons = [];
+    if (completeness < 0.7) negativeReasons.push("部分互动统计缺失，长期质量分已向中性收缩");
+    if (!positiveReasons.length) positiveReasons.push("长期质量由累计沉淀与平滑互动率综合估算");
+    return {
+      value,
+      raw,
+      completeness,
+      absolute,
+      rate,
+      components,
+      positiveReasons,
+      negativeReasons
+    };
   }
-  function freshnessPolicy(parsedQuery, now) {
+  function applyQualityScores(scoredVideos) {
+    for (const item of scoredVideos) item.quality = scoreOneQuality(item.video);
+    return scoredVideos;
+  }
+  function normalizeTimestamp(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return null;
+    return numeric < 1e10 ? numeric * 1e3 : numeric;
+  }
+  function snapshotListFor(snapshots, video) {
+    if (!snapshots) return [];
+    const key = video.bvid ?? video.key;
+    let values;
+    if (snapshots instanceof Map) values = snapshots.get(key);
+    else if (Array.isArray(snapshots)) values = snapshots.filter((snapshot) => (snapshot.bvid ?? snapshot.key) === key);
+    else if (typeof snapshots === "object") values = snapshots[key];
+    if (!Array.isArray(values)) values = values ? [values] : [];
+    return values.map((snapshot) => ({
+      ...snapshot,
+      capturedAt: normalizeTimestamp(snapshot.capturedAt ?? snapshot.sampledAt ?? snapshot.timestamp),
+      stats: snapshot.stats ?? snapshot
+    })).filter((snapshot) => snapshot.capturedAt !== null);
+  }
+  function latestUsableSnapshot(snapshots, video, now) {
+    return snapshotListFor(snapshots, video).filter((snapshot) => snapshot.capturedAt <= now - MIN_SNAPSHOT_INTERVAL_MS).sort((left, right) => right.capturedAt - left.capturedAt)[0] ?? null;
+  }
+  function videoAgeDays(video, now) {
+    const publishedAt = normalizeTimestamp(video.publishedAt);
+    if (publishedAt === null || publishedAt > now) return null;
+    return Math.max(1 / 24, (now - publishedAt) / DAY_MS);
+  }
+  function scoreOneGrowth(video, snapshots, now) {
+    const snapshot = latestUsableSnapshot(snapshots, video, now);
+    const age = videoAgeDays(video, now);
+    const elapsedDays = snapshot ? (now - snapshot.capturedAt) / DAY_MS : null;
+    const components = GROWTH_METRICS.map((metric) => {
+      const current = validStat(video, metric.id);
+      const previous = snapshot ? validStat(snapshot.stats, metric.id) : null;
+      const lifecyclePerDay = current !== null && age !== null ? current / age : null;
+      const lifecycleSignal = lifecyclePerDay === null ? null : sigmoidLog(lifecyclePerDay, metric.dailyAnchor);
+      let actualPerDay = null;
+      let observedSignal = null;
+      if (current !== null && previous !== null && elapsedDays > 0 && current >= previous) {
+        actualPerDay = (current - previous) / elapsedDays;
+        observedSignal = sigmoidLog(actualPerDay, metric.dailyAnchor);
+      }
+      const value2 = observedSignal === null ? lifecycleSignal : lifecycleSignal === null ? observedSignal : 0.7 * observedSignal + 0.3 * lifecycleSignal;
+      return {
+        ...metric,
+        value: value2,
+        current,
+        previous,
+        actualPerDay,
+        lifecyclePerDay,
+        observedSignal,
+        lifecycleSignal
+      };
+    });
+    const observed = components.filter((component) => component.observedSignal !== null);
+    const lifecycle = components.filter((component) => component.lifecycleSignal !== null);
+    const observedWeight = observed.reduce((sum, component) => sum + component.weight, 0);
+    const lifecycleWeight = lifecycle.reduce((sum, component) => sum + component.weight, 0);
+    let status = "unavailable";
+    let confidence = 0;
+    let raw = 0.5;
+    let completeness = 0;
+    if (observedWeight > 0) {
+      status = "observed";
+      raw = weightedAverage(components) ?? 0.5;
+      completeness = observedWeight;
+      const intervalConfidence = clamp((now - snapshot.capturedAt) / (6 * HOUR_MS), 0.25, 1);
+      confidence = clamp((0.65 + 0.35 * intervalConfidence) * completeness);
+    } else if (lifecycleWeight > 0) {
+      status = "estimated";
+      raw = weightedAverage(components, "lifecycleSignal") ?? 0.5;
+      completeness = lifecycleWeight;
+      confidence = 0.35 * completeness;
+    }
+    const value = status === "unavailable" ? 0.5 : clamp(0.5 + (raw - 0.5) * confidence);
+    const positiveReasons = [];
+    const negativeReasons = [];
+    const strongest = [...components].filter((component) => component.value !== null).sort((left, right) => (right.value ?? 0) - (left.value ?? 0))[0];
+    if (strongest?.value >= 0.68) positiveReasons.push(`${strongest.label}增速表现突出`);
+    if (status === "observed") positiveReasons.push(`基于约 ${Math.max(0.25, (now - snapshot.capturedAt) / HOUR_MS).toFixed(1)} 小时的真实增量`);
+    if (status === "estimated") negativeReasons.push("尚无可用历史快照，当前为发布以来平均增速的低置信度估算");
+    if (status === "unavailable") negativeReasons.push("缺少发布时间或统计数据，暂无法估算增长");
+    if (snapshot && observedWeight < lifecycleWeight) negativeReasons.push("部分指标发生回退或缺失，未将其误判为负增长");
+    return {
+      value,
+      raw,
+      completeness,
+      confidence,
+      status,
+      observationHours: snapshot ? (now - snapshot.capturedAt) / HOUR_MS : null,
+      snapshotAt: snapshot?.capturedAt ?? null,
+      components,
+      positiveReasons,
+      negativeReasons
+    };
+  }
+  function applyGrowthScores(scoredVideos, snapshots = null, now = Date.now()) {
+    for (const item of scoredVideos) item.growth = scoreOneGrowth(item.video, snapshots, now);
+    return scoredVideos;
+  }
+  function parseOnlineCount2(value) {
+    if (value === null || value === void 0 || value === "") return null;
+    if (typeof value === "number") return Number.isFinite(value) && value >= 0 ? value : null;
+    const normalized = String(value).trim().replace(/[,，+]/g, "");
+    const match = normalized.match(/([\d.]+)\s*(万|亿)?/);
+    if (!match) return null;
+    const numeric = Number(match[1]);
+    if (!Number.isFinite(numeric) || numeric < 0) return null;
+    const multiplier = match[2] === "亿" ? 1e8 : match[2] === "万" ? 1e4 : 1;
+    return numeric * multiplier;
+  }
+  function onlineValueFor(onlineByBvid, video) {
+    const key = video.bvid ?? video.key;
+    let raw = onlineByBvid instanceof Map ? onlineByBvid.get(key) : onlineByBvid?.[key];
+    raw ??= video.onlineCount ?? video.stats?.onlineCount ?? video.stats?.online;
+    if (raw && typeof raw === "object") {
+      raw = raw.onlineCount ?? raw.total ?? raw.web ?? raw.count ?? raw.data?.total ?? raw.data?.count;
+    }
+    return parseOnlineCount2(raw);
+  }
+  function timelinessPolicy(parsedQuery, now) {
     const currentYear = new Date(now).getFullYear();
     const years = parsedQuery.normalized.match(/(?:19|20)\d{2}/g)?.map(Number) ?? [];
-    if (years.some((year) => year < currentYear - 1)) return { enabled: false, halfLife: 730 };
-    const recentWords = /最新|近期|最近|今日|今天|今年|latest|recent|current/.test(parsedQuery.normalized);
-    if (recentWords || years.includes(currentYear)) return { enabled: true, halfLife: 120 };
-    return { enabled: true, halfLife: 730 };
+    const recentWords = /最新|近期|最近|今日|今天|当下|latest|recent|current/.test(parsedQuery.normalized);
+    if (recentWords) return { halfLifeDays: 30, reason: "查询包含明确的近期意图" };
+    if (years.includes(currentYear)) return { halfLifeDays: 90, reason: "查询包含当前年份" };
+    if (years.some((year) => year < currentYear - 1)) return { halfLifeDays: 730, reason: "历史主题采用较长时效半衰期" };
+    return { halfLifeDays: 180, reason: "使用普通时效半衰期" };
   }
-  function scoreOneQuality(video, groupMetrics, freshness, now) {
-    const components = [];
-    for (const metric of QUALITY_METRICS) {
-      const stat = validStat(video, metric.id);
-      const preparedMetric = groupMetrics[metric.id];
-      const item = preparedMetric.values.find((candidate) => candidate.video === video);
-      if (stat === null || !item) continue;
-      const countSignal = 0.6 * percentile(preparedMetric.countLogs, item.countLog) + 0.4 * percentile(preparedMetric.velocityLogs, item.velocityLog);
-      const rateSignal = metric.rate && item.rate !== null ? percentile(preparedMetric.rates, item.rate) : null;
-      const value2 = rateSignal === null ? countSignal : 0.45 * countSignal + 0.55 * rateSignal;
-      components.push({ id: metric.id, label: metric.label, weight: metric.weight, value: value2, countSignal, rateSignal });
-    }
-    const age = ageDays(video, now);
-    if (freshness.enabled && age !== null) {
-      const value2 = (20 + 80 * Math.pow(2, -age / freshness.halfLife)) / 100;
-      components.push({ id: "freshness", label: "时效", weight: 0.14, value: value2, countSignal: value2, rateSignal: null });
-    }
-    const activeWeight = QUALITY_METRICS.reduce((sum, metric) => sum + metric.weight, 0) + (freshness.enabled ? 0.14 : 0);
-    const availableWeight = components.reduce((sum, component) => sum + component.weight, 0);
-    const raw = availableWeight ? weightedSum(components) / availableWeight : 0.5;
-    const completeness = activeWeight ? availableWeight / activeWeight : 0;
-    const value = clamp(0.5 + (raw - 0.5) * (0.4 + 0.6 * completeness));
-    const strongest = [...components].sort((a, b) => b.value - a.value).slice(0, 2);
-    const positiveReasons = strongest.filter((component) => component.value >= 0.7).map(
-      (component) => component.id === "freshness" ? "发布时间较近" : `${component.label}综合表现处于比较候选前列`
-    );
+  function scoreOneTimeliness(video, parsedQuery, onlineByBvid, now) {
+    const policy = timelinessPolicy(parsedQuery, now);
+    const age = videoAgeDays(video, now);
+    const recency = age === null ? null : clamp(2 ** (-age / policy.halfLifeDays));
+    const onlineCount = onlineValueFor(onlineByBvid, video);
+    const online = onlineCount === null ? null : sigmoidLog(onlineCount, 500, 1);
+    const components = [
+      { id: "recency", label: "发布时间", weight: 0.65, value: recency },
+      { id: "online", label: "正在观看", weight: 0.35, value: online }
+    ];
+    const raw = 0.65 * (recency ?? 0.5) + 0.35 * (online ?? 0.5);
+    const completeness = components.filter((component) => component.value !== null).reduce((sum, component) => sum + component.weight, 0);
+    const value = clamp(raw);
+    const positiveReasons = [];
     const negativeReasons = [];
-    if (completeness < 0.7) negativeReasons.push("部分互动统计缺失，质量分已向中性收缩");
-    if (!positiveReasons.length) positiveReasons.push("质量分仅用于相近相关性结果间的辅助排序");
-    return { value, raw, completeness, components, positiveReasons, negativeReasons };
+    if (recency !== null && recency >= 0.7) positiveReasons.push("发布时间较近");
+    if (online !== null && online >= 0.65) positiveReasons.push("当前观看热度较高");
+    if (online === null) negativeReasons.push("缺少正在观看数据，在线信号按中性值处理");
+    if (age === null) negativeReasons.push("缺少有效发布时间");
+    positiveReasons.push(policy.reason);
+    return {
+      value,
+      raw,
+      completeness,
+      halfLifeDays: policy.halfLifeDays,
+      onlineStatus: onlineCount === null ? "unavailable" : "available",
+      onlineCount,
+      components,
+      positiveReasons,
+      negativeReasons
+    };
   }
-  function applyQualityScores(scoredVideos, parsedQuery, now = Date.now()) {
-    if (!scoredVideos.length) return scoredVideos;
-    const { contextKey, prepared } = qualityContext(scoredVideos.map((item) => item.video), now);
-    const freshness = freshnessPolicy(parsedQuery, now);
+  function applyTimelinessScores(scoredVideos, parsedQuery, onlineByBvid = null, now = Date.now()) {
     for (const item of scoredVideos) {
-      item.quality = scoreOneQuality(item.video, prepared.get(contextKey(item.video)), freshness, now);
+      item.timeliness = scoreOneTimeliness(item.video, parsedQuery, onlineByBvid, now);
     }
     return scoredVideos;
   }
-  function rerankCandidates(videos, query, mode = "standard", options = {}) {
-    const profile = getModeProfile(mode);
+  function applyDimensionScores(scoredVideos, parsedQuery, options = {}) {
+    const now = options.now ?? Date.now();
+    applyQualityScores(scoredVideos);
+    applyGrowthScores(scoredVideos, options.snapshots, now);
+    applyTimelinessScores(scoredVideos, parsedQuery, options.onlineByBvid, now);
+    return scoredVideos;
+  }
+  function scoreForView(item, view) {
+    if (view === "growth") return item.growth.value;
+    if (view === "timeliness") return item.timeliness.value;
+    return item.quality.value;
+  }
+  function rerankCandidates(videos, query, view = "quality", options = {}) {
+    const profile = getModeProfile(view);
     const parsedQuery = parseQuery(query);
     const evaluated = videos.map((video) => ({
       video,
-      relevance: scoreRelevance(video, parsedQuery, mode),
+      relevance: scoreRelevance(video, parsedQuery, profile.id),
       quality: null,
+      growth: null,
+      timeliness: null,
       rank: null
     }));
     const accepted = evaluated.filter((item) => item.relevance.passes);
     const rejected = evaluated.filter((item) => !item.relevance.passes);
-    applyQualityScores(accepted, parsedQuery, options.now ?? Date.now());
+    applyDimensionScores(accepted, parsedQuery, options);
     for (const item of accepted) {
-      const relevanceBand = Math.floor((item.relevance.value + Number.EPSILON) / profile.relevanceBand);
-      const innerScore = profile.relevanceWeight * item.relevance.value + (1 - profile.relevanceWeight) * item.quality.value;
-      item.rank = { relevanceBand, innerScore };
+      const maximumBand = Math.ceil(1 / profile.relevanceBand) - 1;
+      const relevanceBand = Math.min(
+        maximumBand,
+        Math.floor((item.relevance.value + Number.EPSILON) / profile.relevanceBand)
+      );
+      const bandFloor = relevanceBand * profile.relevanceBand;
+      const bandPosition = clamp((item.relevance.value - bandFloor) / profile.relevanceBand);
+      const signal = scoreForView(item, profile.id);
+      const innerScore = profile.relevanceWeight * bandPosition + profile.signalWeight * signal + profile.qualityWeight * item.quality.value;
+      item.rank = { relevanceBand, bandPosition, innerScore, view: profile.id, signal };
     }
     accepted.sort(
-      (left, right) => right.rank.relevanceBand - left.rank.relevanceBand || right.rank.innerScore - left.rank.innerScore || right.relevance.value - left.relevance.value || right.quality.value - left.quality.value || (right.video.publishedAt ?? 0) - (left.video.publishedAt ?? 0) || String(left.video.bvid ?? left.video.key).localeCompare(String(right.video.bvid ?? right.video.key))
+      (left, right) => right.rank.relevanceBand - left.rank.relevanceBand || right.rank.innerScore - left.rank.innerScore || right.relevance.value - left.relevance.value || scoreForView(right, profile.id) - scoreForView(left, profile.id) || right.quality.value - left.quality.value || String(left.video.bvid ?? left.video.key).localeCompare(String(right.video.bvid ?? right.video.key))
     );
     accepted.forEach((item, index) => {
       item.position = index + 1;
     });
+    const admission = resolveAdmissionRules(parsedQuery);
     return {
       mode: profile.id,
+      view: profile.id,
       profile,
       parsedQuery,
       ranked: accepted,
@@ -1366,8 +2138,9 @@
         evaluated: evaluated.length,
         accepted: accepted.length,
         rejected: rejected.length,
-        threshold: profile.threshold,
-        minCoverage: profile.minCoverage
+        threshold: admission.threshold,
+        minCoverage: admission.minCoverage,
+        relevanceBand: profile.relevanceBand
       }
     };
   }
@@ -1387,6 +2160,8 @@
   --bps-pink: #fb7299;
   --bps-good: #2f9b72;
   --bps-warn: #d7862f;
+  --bps-growth: #d57425;
+  --bps-time: #a45bd4;
   --bps-shadow: 0 12px 38px rgba(0, 0, 0, .14);
   color: var(--bps-text);
   color-scheme: light dark;
@@ -1484,7 +2259,7 @@ button { color: inherit; }
   width: 100%;
 }
 .query-input:focus { background: var(--bps-bg); border-color: var(--bps-brand); }
-.primary, .secondary, .mode-button, .page-button, .retry-button {
+.primary, .secondary, .sort-button, .page-button, .retry-button {
   border: 1px solid var(--bps-line);
   border-radius: 9px;
   cursor: pointer;
@@ -1495,11 +2270,11 @@ button { color: inherit; }
 .primary:hover { background: var(--bps-brand-dark); }
 .secondary, .retry-button, .page-button { background: var(--bps-bg); }
 .secondary:hover, .retry-button:hover, .page-button:hover { border-color: var(--bps-brand); color: var(--bps-brand-dark); }
-.mode-row { align-items: center; display: flex; gap: 12px; margin-top: 12px; }
-.mode-group { background: var(--bps-bg-soft); border-radius: 10px; display: inline-flex; gap: 3px; padding: 3px; }
-.mode-button { background: transparent; border-color: transparent; min-height: 36px; padding: 0 15px; }
-.mode-button[aria-pressed="true"] { background: var(--bps-bg); border-color: var(--bps-line); box-shadow: 0 1px 5px rgba(0, 0, 0, .07); color: var(--bps-brand-dark); font-weight: 650; }
-.mode-note { color: var(--bps-text-soft); font-size: 13px; margin: 0; }
+.sort-row { align-items: center; display: flex; gap: 12px; margin-top: 12px; }
+.sort-group { background: var(--bps-bg-soft); border-radius: 10px; display: inline-flex; gap: 3px; padding: 3px; }
+.sort-button { background: transparent; border-color: transparent; min-height: 36px; padding: 0 15px; }
+.sort-button[aria-selected="true"] { background: var(--bps-bg); border-color: var(--bps-line); box-shadow: 0 1px 5px rgba(0, 0, 0, .07); color: var(--bps-brand-dark); font-weight: 650; }
+.sort-note { color: var(--bps-text-soft); font-size: 13px; margin: 0; }
 .sr-only { height: 1px; margin: -1px; overflow: hidden; padding: 0; position: absolute; width: 1px; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
 .content { min-height: 100%; padding-bottom: 54px; padding-top: 18px; }
@@ -1538,14 +2313,25 @@ button { color: inherit; }
 .card-title { color: var(--bps-text); display: -webkit-box; font-size: 15px; font-weight: 650; line-height: 1.45; margin: 0; min-height: 43px; overflow: hidden; text-decoration: none; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .card-title:hover { color: var(--bps-brand-dark); }
 .meta, .metrics { color: var(--bps-text-soft); display: flex; flex-wrap: wrap; font-size: 12px; gap: 5px 10px; margin-top: 8px; }
-.scores { display: flex; gap: 7px; margin-top: 11px; }
-.score { border-radius: 999px; font-size: 12px; font-weight: 650; padding: 4px 8px; }
+.scores { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+.score { border: 1px solid transparent; border-radius: 999px; font-size: 12px; font-weight: 650; padding: 4px 8px; }
 .score-relevance { background: color-mix(in srgb, var(--bps-brand) 13%, var(--bps-bg)); color: var(--bps-brand-dark); }
 .score-quality { background: color-mix(in srgb, var(--bps-good) 12%, var(--bps-bg)); color: var(--bps-good); }
+.score-growth { background: color-mix(in srgb, var(--bps-growth) 12%, var(--bps-bg)); color: var(--bps-growth); }
+.score-timeliness { background: color-mix(in srgb, var(--bps-time) 12%, var(--bps-bg)); color: var(--bps-time); }
+.score.is-selected { border-color: currentColor; box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 16%, transparent); }
+.data-signals { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.data-signal { background: var(--bps-bg-soft); border: 1px solid var(--bps-line); border-radius: 6px; color: var(--bps-text-soft); font-size: 11px; line-height: 1.3; padding: 3px 6px; }
+.growth-status.status-observed, .growth-status.status-real, .online-status.status-available, .online-status.status-sampled { color: var(--bps-good); }
+.growth-status.status-estimated, .growth-status.status-estimate, .growth-status.status-average { color: var(--bps-warn); }
+.growth-status.status-collecting, .growth-status.status-unavailable, .online-status.status-unavailable, .online-status.status-missing { color: var(--bps-text-faint); }
 .reason-primary { color: var(--bps-text-soft); font-size: 12px; line-height: 1.45; margin: 9px 0 0; }
 .explanations { border-top: 1px solid var(--bps-line); margin-top: 10px; padding-top: 8px; }
 .explanations summary { color: var(--bps-text-soft); cursor: pointer; font-size: 12px; }
-.explanations ul { color: var(--bps-text-soft); font-size: 12px; line-height: 1.5; margin: 7px 0 0; padding-left: 18px; }
+.explanation-groups { display: grid; gap: 8px; margin-top: 9px; }
+.explanation-group { background: var(--bps-bg-soft); border-radius: 7px; padding: 7px 9px; }
+.explanation-group h4 { font-size: 12px; margin: 0; }
+.explanation-group ul { color: var(--bps-text-soft); font-size: 12px; line-height: 1.5; margin: 4px 0 0; padding-left: 18px; }
 .match-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
 .match-chip { background: var(--bps-bg-soft); border-radius: 5px; color: var(--bps-text-soft); font-size: 11px; padding: 3px 6px; }
 
@@ -1570,7 +2356,7 @@ button { color: inherit; }
   .toolbar-top { align-items: stretch; flex-wrap: wrap; }
   .heading-wrap { flex: 1; }
   .search-form { flex-basis: 100%; order: 3; }
-  .mode-row { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .sort-row { align-items: flex-start; flex-direction: column; gap: 7px; }
   .results-grid { grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr)); }
 }
 @media (max-width: 520px) {
@@ -1579,14 +2365,19 @@ button { color: inherit; }
   .panel { top: 62px !important; }
   .toolbar-inner, .content { padding-left: 12px; padding-right: 12px; }
   .secondary { padding: 0 10px; }
-  .mode-group { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
-  .mode-button { padding: 0 8px; }
+  .sort-group { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
+  .sort-button { padding: 0 8px; }
   .status-box { align-items: flex-start; }
   .results-grid { grid-template-columns: 1fr; }
   .card { display: grid; grid-template-columns: minmax(130px, 42%) 1fr; }
   .cover-link { align-self: start; margin: 10px 0 10px 10px; }
   .card-body { padding: 10px; }
   .metrics span:nth-child(n+3) { display: none; }
+}
+@media (max-width: 380px) {
+  .card { display: block; }
+  .cover-link { margin: 0; }
+  .data-signal { font-size: 10px; }
 }
 @media (prefers-color-scheme: dark) {
   :host {
@@ -1605,6 +2396,40 @@ button { color: inherit; }
 `;
 
   // src/ui.js
+  var SORT_DESCRIPTIONS = Object.freeze({
+    quality: "优先累计收藏、投币、分享等长期沉淀，不给新视频额外加分",
+    growth: "优先近期真实增速；样本不足时明确标注平均增速估算或积累中",
+    timeliness: "优先发布时间与当前观看热度，长期质量仅作小幅辅助"
+  });
+  var SORT_TABS = Object.freeze(Object.values(SORT_VIEW_PROFILES).map((profile) => Object.freeze({
+    id: profile.id,
+    label: profile.label,
+    description: SORT_DESCRIPTIONS[profile.id] ?? profile.shortDescription
+  })));
+  var DEFAULT_SORT = DEFAULT_SORT_VIEW;
+  var SORT_TAB_MAP = new Map(SORT_TABS.map((tab) => [tab.id, tab]));
+  var GROWTH_STATUS_LABELS = Object.freeze({
+    observed: "真实增速",
+    real: "真实增速",
+    measured: "真实增速",
+    actual: "真实增速",
+    estimated: "平均估算",
+    estimate: "平均估算",
+    average: "平均估算",
+    collecting: "积累中",
+    pending: "积累中",
+    unavailable: "积累中",
+    missing: "积累中"
+  });
+  var ONLINE_STATUS_LABELS = Object.freeze({
+    sampled: "在线已采样",
+    available: "在线已采样",
+    measured: "在线已采样",
+    missing: "在线采样缺失",
+    unavailable: "在线采样缺失",
+    skipped: "未采样在线人数",
+    pending: "在线采样中"
+  });
   var NATIVE_TAB_LABELS = /* @__PURE__ */ new Set(["综合", "视频", "番剧", "影视", "直播", "专栏", "用户"]);
   function normalizeNativeTabLabel(value) {
     return String(value ?? "").trim().replace(/\s*(?:\d+\+?)\s*$/g, "").trim();
@@ -1621,6 +2446,7 @@ button { color: inherit; }
     return node;
   }
   function formatCount(value) {
+    if (value === null || value === void 0 || value === "") return "—";
     const number = Number(value);
     if (!Number.isFinite(number)) return "—";
     if (number >= 1e8) return `${(number / 1e8).toFixed(number >= 1e9 ? 0 : 1)}亿`;
@@ -1631,6 +2457,53 @@ button { color: inherit; }
     const value = Number(timestamp);
     if (!Number.isFinite(value) || value <= 0) return "日期未知";
     return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value));
+  }
+  function numericValue(value) {
+    if (value === null || value === void 0 || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  function formatScore(value) {
+    const number = numericValue(value);
+    return number === null ? "—" : String(Math.round(Math.min(1, Math.max(0, number)) * 100));
+  }
+  function itemCompleteness(item) {
+    const explicit = numericValue(item.dataCompleteness?.value ?? item.dataCompleteness ?? item.completeness);
+    if (explicit !== null) return Math.min(1, Math.max(0, explicit));
+    const available = [item.quality, item.growth, item.timeliness].map((score) => numericValue(score?.completeness)).filter((value) => value !== null);
+    if (!available.length) return 0;
+    return available.reduce((sum, value) => sum + value, 0) / available.length;
+  }
+  function growthStatus(growth = {}) {
+    const raw = String(growth.status ?? growth.kind ?? "").toLocaleLowerCase();
+    if (GROWTH_STATUS_LABELS[raw]) return { key: raw, label: GROWTH_STATUS_LABELS[raw] };
+    if (growth.isReal === true || Number(growth.snapshotCount) >= 2) return { key: "real", label: "真实增速" };
+    if (growth.isEstimated === true) return { key: "estimated", label: "平均估算" };
+    if (Number(growth.snapshotCount) === 1) return { key: "collecting", label: "积累中" };
+    if (numericValue(growth.value) !== null) return { key: "estimated", label: "平均估算" };
+    return { key: "collecting", label: "积累中" };
+  }
+  function onlineSample(item) {
+    const timeliness = item.timeliness ?? {};
+    const count = numericValue(
+      timeliness.onlineCount ?? timeliness.online?.count ?? item.video?.stats?.online
+    );
+    const raw = String(timeliness.onlineStatus ?? timeliness.online?.status ?? "").toLocaleLowerCase();
+    const key = count === null ? raw === "pending" || raw === "skipped" ? raw : "missing" : ONLINE_STATUS_LABELS[raw] ? raw : "sampled";
+    return {
+      count,
+      key,
+      label: count !== null ? `${ONLINE_STATUS_LABELS[key] ?? "在线已采样"} ${formatCount(count)}` : ONLINE_STATUS_LABELS[key]
+    };
+  }
+  function scoreReasons(score) {
+    if (!score) return [];
+    return [
+      ...score.positiveReasons ?? [],
+      ...score.negativeReasons ?? [],
+      ...score.reasons ?? [],
+      ...score.explanations ?? []
+    ].filter(Boolean);
   }
   function setSafeImage(image, url, title) {
     image.alt = title ? `${title} 封面` : "视频封面";
@@ -1657,7 +2530,7 @@ button { color: inherit; }
       this.host = null;
       this.shadow = null;
       this.anchor = null;
-      this.mode = DEFAULT_MODE;
+      this.sort = DEFAULT_SORT;
       this.page = 1;
       this.result = null;
       this.pool = null;
@@ -1666,6 +2539,7 @@ button { color: inherit; }
       this.resizeObserver = null;
       this.repositionFrame = null;
       this.lastProgressBucket = -1;
+      this.lastProgressStage = "";
     }
     mount() {
       if (this.host?.isConnected) return this;
@@ -1689,7 +2563,7 @@ button { color: inherit; }
                 </form>
                 <button class="secondary close-button" type="button">返回原生</button>
               </div>
-              <div class="mode-row"><div class="mode-group" role="group" aria-label="精准搜索模式"></div><p class="mode-note"></p></div>
+              <div class="sort-row"><div class="sort-group" role="tablist" aria-label="精准搜索排序方式"></div><p class="sort-note"></p></div>
             </div>
           </header>
           <main class="content">
@@ -1699,7 +2573,7 @@ button { color: inherit; }
               <span class="sr-only live-status" role="status" aria-live="polite" aria-atomic="true"></span>
             </div>
             <div class="warning" hidden></div>
-            <div class="results-grid"></div>
+            <div class="results-grid" id="bps-results" role="tabpanel" aria-label="精准搜索结果列表"></div>
             <div class="state-view"></div>
             <nav class="pagination" aria-label="精准搜索结果分页" hidden></nav>
           </main>
@@ -1714,8 +2588,8 @@ button { color: inherit; }
         form: this.shadow.querySelector(".search-form"),
         input: this.shadow.querySelector(".query-input"),
         close: this.shadow.querySelector(".close-button"),
-        modeGroup: this.shadow.querySelector(".mode-group"),
-        modeNote: this.shadow.querySelector(".mode-note"),
+        sortGroup: this.shadow.querySelector(".sort-group"),
+        sortNote: this.shadow.querySelector(".sort-note"),
         statusBox: this.shadow.querySelector(".status-box"),
         statusTitle: this.shadow.querySelector(".status-title"),
         statusDetail: this.shadow.querySelector(".status-detail"),
@@ -1728,7 +2602,7 @@ button { color: inherit; }
         pagination: this.shadow.querySelector(".pagination"),
         liveStatus: this.shadow.querySelector(".live-status")
       };
-      this.renderModeButtons();
+      this.renderSortTabs();
       this.bindEvents();
       this.positionToNativeTabs();
       return this;
@@ -1751,25 +2625,54 @@ button { color: inherit; }
       this.window.addEventListener?.("resize", () => this.schedulePosition());
       this.window.addEventListener?.("scroll", () => this.schedulePosition(), { passive: true });
     }
-    renderModeButtons() {
-      this.refs.modeGroup.replaceChildren();
-      for (const profile of Object.values(MODE_PROFILES)) {
-        const button = element(this.document, "button", "mode-button", profile.label);
+    renderSortTabs() {
+      this.refs.sortGroup.replaceChildren();
+      for (const tab of SORT_TABS) {
+        const button = element(this.document, "button", "sort-button", tab.label);
         button.type = "button";
-        button.dataset.mode = profile.id;
-        button.title = profile.shortDescription;
-        button.setAttribute("aria-pressed", String(profile.id === this.mode));
-        button.addEventListener("click", () => this.handlers.onModeChange?.(profile.id));
-        this.refs.modeGroup.append(button);
+        button.setAttribute("role", "tab");
+        button.dataset.sort = tab.id;
+        button.title = tab.description;
+        button.setAttribute("aria-controls", "bps-results");
+        button.addEventListener("click", () => this.requestSort(tab.id));
+        button.addEventListener("keydown", (event) => this.handleSortKeydown(event, tab.id));
+        this.refs.sortGroup.append(button);
       }
-      this.setMode(this.mode);
+      this.setSort(this.sort, { render: false });
     }
-    setMode(mode) {
-      this.mode = MODE_PROFILES[mode] ? mode : DEFAULT_MODE;
-      this.shadow?.querySelectorAll(".mode-button").forEach((button) => {
-        button.setAttribute("aria-pressed", String(button.dataset.mode === this.mode));
+    requestSort(sort) {
+      if (!SORT_TAB_MAP.has(sort) || sort === this.sort) return;
+      this.setSort(sort);
+      this.refs.liveStatus.textContent = `已切换为${SORT_TAB_MAP.get(sort).label}排序`;
+      if (typeof this.handlers.onSortChange === "function") this.handlers.onSortChange(sort);
+      else this.handlers.onModeChange?.(sort);
+    }
+    handleSortKeydown(event, currentSort) {
+      const currentIndex = SORT_TABS.findIndex((tab) => tab.id === currentSort);
+      let nextIndex = currentIndex;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % SORT_TABS.length;
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + SORT_TABS.length) % SORT_TABS.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = SORT_TABS.length - 1;
+      else return;
+      event.preventDefault();
+      const next = SORT_TABS[nextIndex];
+      this.refs.sortGroup.querySelector(`[data-sort="${next.id}"]`)?.focus();
+      this.requestSort(next.id);
+    }
+    setSort(sort, { render = true } = {}) {
+      this.sort = SORT_TAB_MAP.has(sort) ? sort : DEFAULT_SORT;
+      this.shadow?.querySelectorAll(".sort-button").forEach((button) => {
+        const active = button.dataset.sort === this.sort;
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
       });
-      if (this.refs) this.refs.modeNote.textContent = MODE_PROFILES[this.mode].shortDescription;
+      if (this.refs) this.refs.sortNote.textContent = SORT_TAB_MAP.get(this.sort).description;
+      if (render && this.result) this.renderCurrentPage();
+    }
+    // v1.0.x 主控制器的过渡入口；界面已不再呈现“模式”。
+    setMode(sort) {
+      this.setSort(sort);
     }
     setQuery(query) {
       if (this.refs && this.refs.input.value !== query) this.refs.input.value = query;
@@ -1794,11 +2697,25 @@ button { color: inherit; }
     isOpen() {
       return Boolean(this.refs && !this.refs.panel.hidden);
     }
-    setLoading({ completed = 0, total = 1, candidateCount = 0, order = "", page = 1 } = {}) {
-      if (completed === 0 && candidateCount === 0 && !order) this.lastProgressBucket = -1;
+    setLoading({ stage = "recall", completed = 0, total = 1, candidateCount = 0, order = "", page = 1, message = "" } = {}) {
+      if (stage === "recall" && completed === 0) {
+        this.result = null;
+        this.pool = null;
+        this.page = 1;
+      }
+      if (stage !== this.lastProgressStage || completed === 0 && candidateCount === 0 && !order) this.lastProgressBucket = -1;
+      this.lastProgressStage = stage;
       this.refs.panel.setAttribute("aria-busy", "true");
-      this.refs.statusTitle.textContent = `正在扩展候选池… ${completed}/${total}`;
-      this.refs.statusDetail.textContent = order ? `正在读取 ${order} 排序第 ${page} 页，已取得 ${candidateCount} 条有效候选` : "正在连接 B站搜索接口";
+      const stageLabels = {
+        recall: "正在扩展候选池",
+        details: "正在补齐长期质量数据",
+        history: "正在读取增长快照",
+        online: "正在采样当前观看热度",
+        ranking: "正在计算三维评分"
+      };
+      const stageLabel = stageLabels[stage] ?? "正在处理搜索结果";
+      this.refs.statusTitle.textContent = `${stageLabel}… ${completed}/${total}`;
+      this.refs.statusDetail.textContent = message || (order ? `正在读取 ${order} 排序第 ${page} 页，已取得 ${candidateCount} 条有效候选` : stage === "recall" ? "正在连接 B站搜索接口" : `已处理 ${completed}/${total} 条候选`);
       this.refs.progressTrack.hidden = false;
       this.refs.progressBar.style.width = `${Math.round(Math.min(1, completed / Math.max(1, total)) * 100)}%`;
       this.refs.cancel.hidden = false;
@@ -1809,24 +2726,32 @@ button { color: inherit; }
       const bucket = Math.floor(Math.min(1, completed / Math.max(1, total)) * 4);
       if (bucket > this.lastProgressBucket) {
         this.lastProgressBucket = bucket;
-        this.refs.liveStatus.textContent = `精准搜索进度 ${Math.round(bucket * 25)}%`;
+        this.refs.liveStatus.textContent = `${stageLabel} ${Math.round(bucket * 25)}%`;
       }
     }
     setResults(result, pool) {
       this.result = result;
       this.pool = pool;
+      const resultSort = result?.sort ?? result?.view ?? result?.profile?.id ?? result?.ranked?.[0]?.rank?.view;
+      if (SORT_TAB_MAP.has(resultSort)) this.setSort(resultSort, { render: false });
       this.page = 1;
       this.lastError = null;
       this.lastProgressBucket = -1;
+      this.lastProgressStage = "";
       this.refs.panel.setAttribute("aria-busy", "false");
       this.refs.cancel.hidden = true;
       this.refs.progressTrack.hidden = true;
-      this.refs.statusTitle.textContent = `保留 ${result.ranked.length} 条精准结果`;
+      this.refs.statusTitle.textContent = `保留 ${result.ranked.length} 条精准结果 · ${SORT_TAB_MAP.get(this.sort).label}`;
       this.refs.statusDetail.textContent = `接口返回 ${pool.rawCount} 条 · 有效 ${pool.validCount} 条 · 去重 ${pool.uniqueCount} 条 · 门槛过滤 ${result.rejected.length} 条`;
       this.refs.liveStatus.textContent = `精准搜索完成，保留 ${result.ranked.length} 条结果`;
-      if (pool.errors.length) {
+      const candidateErrorCount = pool.errors?.length ?? 0;
+      const enrichmentErrorCount = pool.enrichmentErrors?.length ?? 0;
+      if (candidateErrorCount || enrichmentErrorCount) {
         this.refs.warning.hidden = false;
-        this.refs.warning.textContent = `${pool.errors.length} 路候选请求未完成；已用其余成功结果排序。`;
+        const warnings = [];
+        if (candidateErrorCount) warnings.push(`${candidateErrorCount} 路候选请求未完成`);
+        if (enrichmentErrorCount) warnings.push(`有 ${enrichmentErrorCount} 项详情或在线数据补全失败，已按可用数据降级`);
+        this.refs.warning.textContent = `${warnings.join("；")}。`;
       } else {
         this.refs.warning.hidden = true;
       }
@@ -1837,6 +2762,7 @@ button { color: inherit; }
       this.pool = null;
       this.lastError = error;
       this.lastProgressBucket = -1;
+      this.lastProgressStage = "";
       this.refs.panel.setAttribute("aria-busy", "false");
       this.refs.cancel.hidden = true;
       this.refs.progressTrack.hidden = true;
@@ -1850,6 +2776,7 @@ button { color: inherit; }
     }
     setCancelled() {
       this.lastProgressBucket = -1;
+      this.lastProgressStage = "";
       this.refs.panel.setAttribute("aria-busy", "false");
       this.refs.cancel.hidden = true;
       this.refs.progressTrack.hidden = true;
@@ -1874,11 +2801,13 @@ button { color: inherit; }
       this.refs.grid.replaceChildren();
       this.refs.stateView.replaceChildren();
       if (!this.result?.ranked.length) {
-        const profile = MODE_PROFILES[this.mode];
+        const threshold = numericValue(this.result?.stats?.threshold);
+        const minCoverage = numericValue(this.result?.stats?.minCoverage);
+        const limits = threshold === null || minCoverage === null ? "当前查询没有内容达到统一相关性准入规则。" : `当前相关性至少 ${Math.round(threshold * 100)} 分、覆盖至少 ${Math.round(minCoverage * 100)}%。`;
         this.refs.stateView.append(this.buildState(
           "empty",
           "没有结果通过相关性硬门槛",
-          `当前为${profile.label}模式（相关性至少 ${Math.round(profile.threshold * 100)} 分、覆盖至少 ${Math.round(profile.minCoverage * 100)}%）。可核对关键词，或切换到探索模式。`
+          `${limits} 可核对关键词、引号短语、型号或排除词后重试。`
         ));
         this.refs.pagination.hidden = true;
         return;
@@ -1892,15 +2821,23 @@ button { color: inherit; }
       this.renderPagination(totalPages);
     }
     buildCard(item) {
-      const { video, relevance, quality } = item;
+      const { video, relevance } = item;
+      const quality = item.quality ?? {};
+      const growth = item.growth ?? {};
+      const timeliness = item.timeliness ?? {};
+      const selectedScore = item[this.sort] ?? quality;
+      const selectedTab = SORT_TAB_MAP.get(this.sort);
+      const completeness = itemCompleteness(item);
+      const growthState = growthStatus(growth);
+      const online = onlineSample(item);
       const card = element(this.document, "article", "card");
       const coverLink = externalLink(this.document, "cover-link", "", video.url);
       const image = element(this.document, "img", "cover");
       setSafeImage(image, video.coverUrl, video.title);
       coverLink.append(image);
       if (video.durationText) coverLink.append(element(this.document, "span", "duration", video.durationText));
-      const sourceLabels = [...new Set(video.sources.map((source) => source.orderLabel))];
-      coverLink.append(element(this.document, "span", "source-badge", `${sourceLabels.length} 路召回`));
+      const sourceLabels = [...new Set((video.sources ?? []).map((source) => source.orderLabel).filter(Boolean))];
+      coverLink.append(element(this.document, "span", "source-badge", sourceLabels.length ? `${sourceLabels.length} 路召回` : "候选来源未知"));
       const body = element(this.document, "div", "card-body");
       body.append(externalLink(this.document, "card-title", video.title || video.bvid, video.url));
       const meta = element(this.document, "div", "meta");
@@ -1919,31 +2856,85 @@ button { color: inherit; }
       );
       body.append(metrics);
       const scores = element(this.document, "div", "scores");
-      scores.append(
-        element(this.document, "span", "score score-relevance", `相关 ${Math.round(relevance.value * 100)}`),
-        element(this.document, "span", "score score-quality", `质量 ${Math.round(quality.value * 100)}`)
-      );
+      const scoreDefinitions = [
+        { key: "relevance", label: "相关", longLabel: "相关性", value: relevance?.value },
+        { key: "quality", label: "Q", longLabel: "长期质量", value: quality.value },
+        { key: "growth", label: "G", longLabel: "增长趋势", value: growth.value },
+        { key: "timeliness", label: "T", longLabel: "最新热播", value: timeliness.value }
+      ];
+      for (const score of scoreDefinitions) {
+        const badge = element(
+          this.document,
+          "span",
+          `score score-${score.key}${score.key === this.sort ? " is-selected" : ""}`,
+          `${score.label} ${formatScore(score.value)}`
+        );
+        badge.title = `${score.longLabel}评分：${formatScore(score.value)}`;
+        scores.append(badge);
+      }
       body.append(scores);
-      const primaryReason = relevance.positiveReasons[0] ?? quality.positiveReasons[0] ?? "通过相关性硬门槛";
-      body.append(element(this.document, "p", "reason-primary", primaryReason));
+      const dataSignals = element(this.document, "div", "data-signals");
+      const completenessBadge = element(this.document, "span", "data-signal completeness", `数据 ${Math.round(completeness * 100)}%`);
+      completenessBadge.title = "质量、增长、时效三项评分的数据完整度";
+      const growthBadge = element(this.document, "span", `data-signal growth-status status-${growthState.key}`, growthState.label);
+      const observationHours = numericValue(growth.observationHours);
+      growthBadge.title = growthState.label === "真实增速" && observationHours !== null ? `根据约 ${observationHours.toFixed(observationHours >= 10 ? 0 : 1)} 小时采样窗口计算` : growthState.label === "平均估算" ? "尚无足够历史快照，按发布以来平均增速估算" : "需要后续采样才能计算真实增速";
+      const onlineBadge = element(this.document, "span", `data-signal online-status status-${online.key}`, online.label ?? "在线采样缺失");
+      onlineBadge.title = online.count === null ? "当前未取得正在观看人数；时效分已对缺失数据作中性处理" : "当前页面周期内采样到的正在观看人数，数值可能随时间波动";
+      dataSignals.append(completenessBadge, growthBadge, onlineBadge);
+      body.append(dataSignals);
+      const primaryReason = scoreReasons(selectedScore)[0] ?? relevance?.positiveReasons?.[0] ?? "通过相关性硬门槛";
+      body.append(element(this.document, "p", "reason-primary", `${selectedTab.label}：${primaryReason}`));
       const chips = element(this.document, "div", "match-list");
-      for (const match of relevance.matchedTerms.slice(0, 6)) {
+      for (const match of (relevance?.matchedTerms ?? []).slice(0, 6)) {
         const suffix = match.fuzzy ? "≈" : "→";
         chips.append(element(this.document, "span", "match-chip", `${match.term}${suffix}${match.fields.join("/")}`));
       }
       if (chips.childElementCount) body.append(chips);
       const details = element(this.document, "details", "explanations");
-      details.append(element(this.document, "summary", "", "查看匹配与质量说明"));
-      const list = element(this.document, "ul");
-      const reasons = [
-        ...relevance.positiveReasons,
-        ...relevance.negativeReasons,
-        ...quality.positiveReasons,
-        ...quality.negativeReasons,
-        `候选来源：${sourceLabels.join("、")}`
-      ];
-      for (const reason of [...new Set(reasons)].slice(0, 8)) list.append(element(this.document, "li", "", reason));
-      details.append(list);
+      details.append(element(this.document, "summary", "", "查看相关性与三维评分说明"));
+      const explanationGroups = element(this.document, "div", "explanation-groups");
+      const appendGroup = (label, reasons, fallback) => {
+        const group = element(this.document, "section", "explanation-group");
+        group.append(element(this.document, "h4", "", label));
+        const list = element(this.document, "ul");
+        const uniqueReasons = [...new Set(reasons.filter(Boolean))].slice(0, 4);
+        for (const reason of uniqueReasons.length ? uniqueReasons : [fallback]) {
+          list.append(element(this.document, "li", "", reason));
+        }
+        group.append(list);
+        explanationGroups.append(group);
+      };
+      appendGroup(
+        `相关性 ${formatScore(relevance?.value)}`,
+        [...relevance?.positiveReasons ?? [], ...relevance?.negativeReasons ?? []],
+        "已通过统一相关性硬门槛"
+      );
+      appendGroup(`长期质量 Q ${formatScore(quality.value)}`, scoreReasons(quality), "长期质量数据不足，评分已向中性收缩");
+      appendGroup(
+        `增长趋势 G ${formatScore(growth.value)}`,
+        [
+          ...scoreReasons(growth),
+          growthState.label === "真实增速" && observationHours !== null ? `采用约 ${observationHours.toFixed(1)} 小时的真实采样增量` : "",
+          growthState.label === "平均估算" ? "当前按发布以来平均增速估算，尚不代表近期真实增长" : "",
+          growthState.label === "积累中" ? "历史快照不足，增长数据仍在积累中" : ""
+        ],
+        "增长数据仍在积累中"
+      );
+      appendGroup(
+        `最新热播 T ${formatScore(timeliness.value)}`,
+        [
+          ...scoreReasons(timeliness),
+          online.count === null ? "正在观看人数未取得，在线信号按缺失处理" : `在线采样：${formatCount(online.count)} 人正在观看`
+        ],
+        "按发布时间评估；当前没有可用的在线采样"
+      );
+      appendGroup(
+        "候选来源",
+        sourceLabels.length ? [`来自${sourceLabels.length}路召回：${sourceLabels.join("、")}`] : [],
+        "候选来源未记录"
+      );
+      details.append(explanationGroups);
       body.append(details);
       card.append(coverLink, body);
       return card;
@@ -2047,6 +3038,9 @@ button { color: inherit; }
   // src/main.js
   var LOCATION_EVENT = "bps:locationchange";
   var ALLOWED_PATHS = /* @__PURE__ */ new Set(["/all", "/all/", "/video", "/video/"]);
+  var SORT_KEYS = Object.freeze(Object.keys(MODE_PROFILES));
+  var DETAIL_ENRICH_LIMIT = 60;
+  var ONLINE_SAMPLE_LIMIT = 24;
   function currentContext(locationRef = location) {
     const url = new URL(locationRef.href);
     return {
@@ -2070,6 +3064,40 @@ ${(url.searchParams.get("keyword") ?? "").trim()}`,
       storage?.setItem(key, value);
     } catch {
     }
+  }
+  function rankingOptions({ now, snapshots, onlineByBvid } = {}) {
+    return { now: now ?? Date.now(), snapshots, onlineByBvid };
+  }
+  function buildRankings(videos, query, options = {}) {
+    return Object.fromEntries(SORT_KEYS.map((sort) => [
+      sort,
+      rerankCandidates(videos, query, sort, rankingOptions(options))
+    ]));
+  }
+  function balancedEnrichmentShortlist(rankings, limit = DETAIL_ENRICH_LIMIT) {
+    const rankedLists = SORT_KEYS.map((sort) => rankings?.[sort]?.ranked ?? []);
+    const selected = [];
+    const seen = /* @__PURE__ */ new Set();
+    let position = 0;
+    while (selected.length < limit && rankedLists.some((items) => position < items.length)) {
+      for (const items of rankedLists) {
+        const video = items[position]?.video;
+        const key = String(video?.bvid ?? video?.key ?? "");
+        if (!video || !key || seen.has(key)) continue;
+        seen.add(key);
+        selected.push(video);
+        if (selected.length >= limit) break;
+      }
+      position += 1;
+    }
+    return selected;
+  }
+  function mergeEnrichedVideos(videos, enrichedVideos) {
+    const replacements = new Map((enrichedVideos ?? []).map((video) => [
+      String(video?.bvid ?? video?.key ?? ""),
+      video
+    ]));
+    return (videos ?? []).map((video) => replacements.get(String(video?.bvid ?? video?.key ?? "")) ?? video);
   }
   function installLocationWatcher(windowRef = window) {
     const marker = Symbol.for("bilibili-precision-search:location-watcher");
@@ -2181,18 +3209,26 @@ ${(url.searchParams.get("keyword") ?? "").trim()}`,
     }
   };
   var PrecisionSearchApp = class {
-    constructor({ documentRef = document, windowRef = window, adapter = new BilibiliSearchApiAdapter() } = {}) {
+    constructor({
+      documentRef = document,
+      windowRef = window,
+      adapter = new BilibiliSearchApiAdapter(),
+      historyStore = null
+    } = {}) {
       this.document = documentRef;
       this.window = windowRef;
       this.adapter = adapter;
-      const storedMode = safeStorageGet(windowRef.localStorage, STORAGE_MODE_KEY, DEFAULT_MODE);
-      this.mode = MODE_PROFILES[storedMode] ? storedMode : DEFAULT_MODE;
+      const storedSort = safeStorageGet(windowRef.localStorage, STORAGE_MODE_KEY, DEFAULT_MODE);
+      this.sort = MODE_PROFILES[storedSort] ? storedSort : DEFAULT_MODE;
+      this.mode = this.sort;
+      this.historyStore = historyStore ?? new MetricHistoryStore({ storage: windowRef.localStorage });
       this.view = null;
       this.guard = new NativePageGuard(documentRef);
       this.controller = null;
       this.generation = 0;
       this.context = currentContext(windowRef.location);
       this.cache = /* @__PURE__ */ new Map();
+      this.activeSearch = null;
       this.mutationObserver = null;
       this.nativeSyncFrame = null;
     }
@@ -2206,10 +3242,10 @@ ${(url.searchParams.get("keyword") ?? "").trim()}`,
           onCancel: () => this.cancel(),
           onSearch: (query) => this.search(query),
           onRetry: () => this.search(this.view.refs.input.value),
-          onModeChange: (mode) => this.changeMode(mode)
+          onSortChange: (sort) => this.changeSort(sort)
         }
       }).mount();
-      this.view.setMode(this.mode);
+      this.view.setSort(this.sort);
       this.view.setQuery(this.context.keyword);
       this.view.setAvailable(this.context.available);
       this.window.addEventListener(LOCATION_EVENT, () => this.syncContext());
@@ -2254,12 +3290,19 @@ ${(url.searchParams.get("keyword") ?? "").trim()}`,
       this.controller = null;
       if (!silent && this.view.isOpen()) this.view.setCancelled();
     }
-    changeMode(mode) {
-      if (!MODE_PROFILES[mode] || mode === this.mode) return;
-      this.mode = mode;
-      safeStorageSet(this.window.localStorage, STORAGE_MODE_KEY, mode);
-      this.view.setMode(mode);
-      if (this.view.isOpen()) this.search(this.view.refs.input.value);
+    changeSort(sort) {
+      if (!MODE_PROFILES[sort]) return;
+      this.sort = sort;
+      this.mode = sort;
+      safeStorageSet(this.window.localStorage, STORAGE_MODE_KEY, sort);
+      this.view.setSort(sort, { render: false });
+      if (!this.controller && this.activeSearch?.rankings?.[sort]) {
+        this.view.setResults(this.activeSearch.rankings[sort], this.activeSearch.pool);
+      }
+    }
+    // Compatibility method for callers written against v1.0.x.
+    changeMode(sort) {
+      this.changeSort(sort);
     }
     async search(rawQuery) {
       const query = String(rawQuery ?? "").trim();
@@ -2268,38 +3311,108 @@ ${(url.searchParams.get("keyword") ?? "").trim()}`,
       this.guard.activate();
       this.cancel({ silent: true });
       const generation = this.generation;
+      this.activeSearch = null;
       const parsedQuery = parseQuery(query);
       if (!query || !parsedQuery.terms.length) {
         this.view.setError(new Error("请输入至少一个正向关键词"));
         return;
       }
-      const cacheKey = `${this.mode}
-${query}`;
+      const cacheKey = query;
       const cached = this.cache.get(cacheKey);
       if (cached && Date.now() - cached.createdAt < CACHE_TTL_MS) {
-        this.view.setResults(cached.result, cached.pool);
+        this.activeSearch = cached;
+        this.view.setResults(cached.rankings[this.sort], cached.pool);
         return;
       }
       this.controller = new AbortController();
       const signal = this.controller.signal;
-      const profile = getModeProfile(this.mode);
-      this.view.setLoading({ total: profile.orders.length * profile.pagesPerOrder });
+      const profile = getModeProfile(DEFAULT_MODE);
+      this.view.setLoading({ stage: "recall", total: profile.orders.length * profile.pagesPerOrder });
       try {
         const pool = await this.adapter.collectCandidates(parsedQuery.normalized, profile, {
           signal,
           onProgress: (progress) => {
             if (generation !== this.generation) return;
-            this.view.setLoading(progress);
+            this.view.setLoading({ ...progress, stage: "recall" });
           }
         });
         if (generation !== this.generation) return;
-        const result = rerankCandidates(pool.videos, query, this.mode);
+        pool.errors ??= [];
+        const now = Date.now();
+        this.view.setLoading({ stage: "history", completed: 0, total: 1 });
+        const snapshots = this.historyStore.snapshotsFor(pool.videos);
+        let workingVideos = pool.videos;
+        let onlineByBvid = /* @__PURE__ */ new Map();
+        const enrichmentErrors = [];
+        const preliminaryRankings = buildRankings(workingVideos, query, { now, snapshots });
+        const detailShortlist = balancedEnrichmentShortlist(preliminaryRankings, DETAIL_ENRICH_LIMIT);
+        if (detailShortlist.length && typeof this.adapter.enrichStats === "function") {
+          this.view.setLoading({ stage: "details", completed: 0, total: detailShortlist.length });
+          try {
+            const details = await this.adapter.enrichStats(detailShortlist, {
+              signal,
+              detailLimit: DETAIL_ENRICH_LIMIT,
+              includeOnline: false,
+              onProgress: (progress) => {
+                if (generation !== this.generation) return;
+                this.view.setLoading({
+                  stage: "details",
+                  completed: progress.completed,
+                  total: progress.total
+                });
+              }
+            });
+            if (generation !== this.generation) return;
+            workingVideos = mergeEnrichedVideos(workingVideos, details.enrichedVideos ?? details.videos);
+            enrichmentErrors.push(...details.errors ?? []);
+            pool.detailEnrichedCount = details.detailEnrichedCount ?? 0;
+            pool.detailSkippedCount = details.skippedBvids?.length ?? 0;
+          } catch (error) {
+            if (error?.name === "AbortError" || error?.kind === "risk" || error?.kind === "signature") throw error;
+            enrichmentErrors.push({ phase: "detail", message: error?.message ?? String(error) });
+          }
+        }
+        const rankingsBeforeOnline = buildRankings(workingVideos, query, { now, snapshots });
+        const onlineShortlist = rankingsBeforeOnline.timeliness.ranked.slice(0, ONLINE_SAMPLE_LIMIT).map((item) => item.video);
+        if (onlineShortlist.length && typeof this.adapter.getOnlineForVideos === "function") {
+          this.view.setLoading({ stage: "online", completed: 0, total: onlineShortlist.length });
+          try {
+            const online = await this.adapter.getOnlineForVideos(onlineShortlist, {
+              signal,
+              limit: ONLINE_SAMPLE_LIMIT,
+              concurrency: 2,
+              onProgress: (progress) => {
+                if (generation !== this.generation) return;
+                this.view.setLoading({
+                  stage: "online",
+                  completed: progress.completed,
+                  total: progress.total
+                });
+              }
+            });
+            if (generation !== this.generation) return;
+            onlineByBvid = online.onlineByBvid ?? /* @__PURE__ */ new Map();
+            enrichmentErrors.push(...online.errors ?? []);
+            pool.onlineEnrichedCount = online.enrichedCount ?? 0;
+          } catch (error) {
+            if (error?.name === "AbortError" || error?.kind === "risk" || error?.kind === "signature") throw error;
+            enrichmentErrors.push({ phase: "online", message: error?.message ?? String(error) });
+          }
+        }
+        this.view.setLoading({ stage: "ranking", completed: 0, total: 1 });
+        const rankings = buildRankings(workingVideos, query, { now, snapshots, onlineByBvid });
+        pool.enrichmentErrors = enrichmentErrors;
+        const snapshotCandidates = rankings.quality.ranked.map((item) => item.video).filter((video) => ["complete", "partial"].includes(video.enrichment?.detail));
+        this.historyStore.record(snapshotCandidates);
+        this.view.setLoading({ stage: "ranking", completed: 1, total: 1 });
         for (const [key, entry] of this.cache) {
           if (Date.now() - entry.createdAt >= CACHE_TTL_MS) this.cache.delete(key);
         }
         while (this.cache.size >= 20) this.cache.delete(this.cache.keys().next().value);
-        this.cache.set(cacheKey, { createdAt: Date.now(), result, pool });
-        this.view.setResults(result, pool);
+        const completedSearch = { createdAt: Date.now(), query, rankings, pool };
+        this.cache.set(cacheKey, completedSearch);
+        this.activeSearch = completedSearch;
+        this.view.setResults(rankings[this.sort], pool);
       } catch (error) {
         if (generation !== this.generation || error?.name === "AbortError") return;
         this.view.setError(error);

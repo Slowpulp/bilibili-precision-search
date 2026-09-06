@@ -6,12 +6,16 @@ import {
   getModeProfile,
 } from "./constants.js";
 import { BilibiliSearchApiAdapter } from "./api-adapter.js";
+import { MetricHistoryStore } from "./metric-history.js";
 import { rerankCandidates } from "./scoring.js";
 import { parseQuery } from "./text.js";
 import { NATIVE_TAB_LABELS, PrecisionSearchView, normalizeNativeTabLabel } from "./ui.js";
 
 const LOCATION_EVENT = "bps:locationchange";
 const ALLOWED_PATHS = new Set(["/all", "/all/", "/video", "/video/"]);
+const SORT_KEYS = Object.freeze(Object.keys(MODE_PROFILES));
+const DETAIL_ENRICH_LIMIT = 60;
+const ONLINE_SAMPLE_LIMIT = 24;
 
 export function currentContext(locationRef = location) {
   const url = new URL(locationRef.href);
@@ -30,6 +34,44 @@ function safeStorageGet(storage, key, fallback) {
 
 function safeStorageSet(storage, key, value) {
   try { storage?.setItem(key, value); } catch { /* storage can be blocked */ }
+}
+
+function rankingOptions({ now, snapshots, onlineByBvid } = {}) {
+  return { now: now ?? Date.now(), snapshots, onlineByBvid };
+}
+
+export function buildRankings(videos, query, options = {}) {
+  return Object.fromEntries(SORT_KEYS.map((sort) => [
+    sort,
+    rerankCandidates(videos, query, sort, rankingOptions(options)),
+  ]));
+}
+
+export function balancedEnrichmentShortlist(rankings, limit = DETAIL_ENRICH_LIMIT) {
+  const rankedLists = SORT_KEYS.map((sort) => rankings?.[sort]?.ranked ?? []);
+  const selected = [];
+  const seen = new Set();
+  let position = 0;
+  while (selected.length < limit && rankedLists.some((items) => position < items.length)) {
+    for (const items of rankedLists) {
+      const video = items[position]?.video;
+      const key = String(video?.bvid ?? video?.key ?? "");
+      if (!video || !key || seen.has(key)) continue;
+      seen.add(key);
+      selected.push(video);
+      if (selected.length >= limit) break;
+    }
+    position += 1;
+  }
+  return selected;
+}
+
+export function mergeEnrichedVideos(videos, enrichedVideos) {
+  const replacements = new Map((enrichedVideos ?? []).map((video) => [
+    String(video?.bvid ?? video?.key ?? ""),
+    video,
+  ]));
+  return (videos ?? []).map((video) => replacements.get(String(video?.bvid ?? video?.key ?? "")) ?? video);
 }
 
 export function installLocationWatcher(windowRef = window) {
@@ -141,18 +183,27 @@ class NativePageGuard {
 }
 
 export class PrecisionSearchApp {
-  constructor({ documentRef = document, windowRef = window, adapter = new BilibiliSearchApiAdapter() } = {}) {
+  constructor({
+    documentRef = document,
+    windowRef = window,
+    adapter = new BilibiliSearchApiAdapter(),
+    historyStore = null,
+  } = {}) {
     this.document = documentRef;
     this.window = windowRef;
     this.adapter = adapter;
-    const storedMode = safeStorageGet(windowRef.localStorage, STORAGE_MODE_KEY, DEFAULT_MODE);
-    this.mode = MODE_PROFILES[storedMode] ? storedMode : DEFAULT_MODE;
+    const storedSort = safeStorageGet(windowRef.localStorage, STORAGE_MODE_KEY, DEFAULT_MODE);
+    this.sort = MODE_PROFILES[storedSort] ? storedSort : DEFAULT_MODE;
+    // Kept as a compatibility property for integrations written against v1.0.x.
+    this.mode = this.sort;
+    this.historyStore = historyStore ?? new MetricHistoryStore({ storage: windowRef.localStorage });
     this.view = null;
     this.guard = new NativePageGuard(documentRef);
     this.controller = null;
     this.generation = 0;
     this.context = currentContext(windowRef.location);
     this.cache = new Map();
+    this.activeSearch = null;
     this.mutationObserver = null;
     this.nativeSyncFrame = null;
   }
@@ -167,10 +218,10 @@ export class PrecisionSearchApp {
         onCancel: () => this.cancel(),
         onSearch: (query) => this.search(query),
         onRetry: () => this.search(this.view.refs.input.value),
-        onModeChange: (mode) => this.changeMode(mode),
+        onSortChange: (sort) => this.changeSort(sort),
       },
     }).mount();
-    this.view.setMode(this.mode);
+    this.view.setSort(this.sort);
     this.view.setQuery(this.context.keyword);
     this.view.setAvailable(this.context.available);
     this.window.addEventListener(LOCATION_EVENT, () => this.syncContext());
@@ -221,12 +272,20 @@ export class PrecisionSearchApp {
     if (!silent && this.view.isOpen()) this.view.setCancelled();
   }
 
-  changeMode(mode) {
-    if (!MODE_PROFILES[mode] || mode === this.mode) return;
-    this.mode = mode;
-    safeStorageSet(this.window.localStorage, STORAGE_MODE_KEY, mode);
-    this.view.setMode(mode);
-    if (this.view.isOpen()) this.search(this.view.refs.input.value);
+  changeSort(sort) {
+    if (!MODE_PROFILES[sort]) return;
+    this.sort = sort;
+    this.mode = sort;
+    safeStorageSet(this.window.localStorage, STORAGE_MODE_KEY, sort);
+    this.view.setSort(sort, { render: false });
+    if (!this.controller && this.activeSearch?.rankings?.[sort]) {
+      this.view.setResults(this.activeSearch.rankings[sort], this.activeSearch.pool);
+    }
+  }
+
+  // Compatibility method for callers written against v1.0.x.
+  changeMode(sort) {
+    this.changeSort(sort);
   }
 
   async search(rawQuery) {
@@ -236,38 +295,121 @@ export class PrecisionSearchApp {
     this.guard.activate();
     this.cancel({ silent: true });
     const generation = this.generation;
+    this.activeSearch = null;
     const parsedQuery = parseQuery(query);
     if (!query || !parsedQuery.terms.length) {
       this.view.setError(new Error("请输入至少一个正向关键词"));
       return;
     }
-    const cacheKey = `${this.mode}\n${query}`;
+    const cacheKey = query;
     const cached = this.cache.get(cacheKey);
     if (cached && Date.now() - cached.createdAt < CACHE_TTL_MS) {
-      this.view.setResults(cached.result, cached.pool);
+      this.activeSearch = cached;
+      this.view.setResults(cached.rankings[this.sort], cached.pool);
       return;
     }
 
     this.controller = new AbortController();
     const signal = this.controller.signal;
-    const profile = getModeProfile(this.mode);
-    this.view.setLoading({ total: profile.orders.length * profile.pagesPerOrder });
+    // Every ranking view shares this one recall/admission profile.
+    const profile = getModeProfile(DEFAULT_MODE);
+    this.view.setLoading({ stage: "recall", total: profile.orders.length * profile.pagesPerOrder });
     try {
       const pool = await this.adapter.collectCandidates(parsedQuery.normalized, profile, {
         signal,
         onProgress: (progress) => {
           if (generation !== this.generation) return;
-          this.view.setLoading(progress);
+          this.view.setLoading({ ...progress, stage: "recall" });
         },
       });
       if (generation !== this.generation) return;
-      const result = rerankCandidates(pool.videos, query, this.mode);
+      pool.errors ??= [];
+      const now = Date.now();
+
+      this.view.setLoading({ stage: "history", completed: 0, total: 1 });
+      const snapshots = this.historyStore.snapshotsFor(pool.videos);
+      let workingVideos = pool.videos;
+      let onlineByBvid = new Map();
+      const enrichmentErrors = [];
+
+      const preliminaryRankings = buildRankings(workingVideos, query, { now, snapshots });
+      const detailShortlist = balancedEnrichmentShortlist(preliminaryRankings, DETAIL_ENRICH_LIMIT);
+      if (detailShortlist.length && typeof this.adapter.enrichStats === "function") {
+        this.view.setLoading({ stage: "details", completed: 0, total: detailShortlist.length });
+        try {
+          const details = await this.adapter.enrichStats(detailShortlist, {
+            signal,
+            detailLimit: DETAIL_ENRICH_LIMIT,
+            includeOnline: false,
+            onProgress: (progress) => {
+              if (generation !== this.generation) return;
+              this.view.setLoading({
+                stage: "details",
+                completed: progress.completed,
+                total: progress.total,
+              });
+            },
+          });
+          if (generation !== this.generation) return;
+          workingVideos = mergeEnrichedVideos(workingVideos, details.enrichedVideos ?? details.videos);
+          enrichmentErrors.push(...(details.errors ?? []));
+          pool.detailEnrichedCount = details.detailEnrichedCount ?? 0;
+          pool.detailSkippedCount = details.skippedBvids?.length ?? 0;
+        } catch (error) {
+          if (error?.name === "AbortError" || error?.kind === "risk" || error?.kind === "signature") throw error;
+          enrichmentErrors.push({ phase: "detail", message: error?.message ?? String(error) });
+        }
+      }
+
+      const rankingsBeforeOnline = buildRankings(workingVideos, query, { now, snapshots });
+      const onlineShortlist = rankingsBeforeOnline.timeliness.ranked
+        .slice(0, ONLINE_SAMPLE_LIMIT)
+        .map((item) => item.video);
+      if (onlineShortlist.length && typeof this.adapter.getOnlineForVideos === "function") {
+        this.view.setLoading({ stage: "online", completed: 0, total: onlineShortlist.length });
+        try {
+          const online = await this.adapter.getOnlineForVideos(onlineShortlist, {
+            signal,
+            limit: ONLINE_SAMPLE_LIMIT,
+            concurrency: 2,
+            onProgress: (progress) => {
+              if (generation !== this.generation) return;
+              this.view.setLoading({
+                stage: "online",
+                completed: progress.completed,
+                total: progress.total,
+              });
+            },
+          });
+          if (generation !== this.generation) return;
+          onlineByBvid = online.onlineByBvid ?? new Map();
+          enrichmentErrors.push(...(online.errors ?? []));
+          pool.onlineEnrichedCount = online.enrichedCount ?? 0;
+        } catch (error) {
+          if (error?.name === "AbortError" || error?.kind === "risk" || error?.kind === "signature") throw error;
+          enrichmentErrors.push({ phase: "online", message: error?.message ?? String(error) });
+        }
+      }
+
+      this.view.setLoading({ stage: "ranking", completed: 0, total: 1 });
+      const rankings = buildRankings(workingVideos, query, { now, snapshots, onlineByBvid });
+      pool.enrichmentErrors = enrichmentErrors;
+      // Search cards sometimes expose zero placeholders for interactions. Only
+      // persist authoritative detail/stat responses, otherwise a later detail
+      // fetch could look like explosive growth from a fake zero baseline.
+      const snapshotCandidates = rankings.quality.ranked
+        .map((item) => item.video)
+        .filter((video) => ["complete", "partial"].includes(video.enrichment?.detail));
+      this.historyStore.record(snapshotCandidates);
+      this.view.setLoading({ stage: "ranking", completed: 1, total: 1 });
       for (const [key, entry] of this.cache) {
         if (Date.now() - entry.createdAt >= CACHE_TTL_MS) this.cache.delete(key);
       }
       while (this.cache.size >= 20) this.cache.delete(this.cache.keys().next().value);
-      this.cache.set(cacheKey, { createdAt: Date.now(), result, pool });
-      this.view.setResults(result, pool);
+      const completedSearch = { createdAt: Date.now(), query, rankings, pool };
+      this.cache.set(cacheKey, completedSearch);
+      this.activeSearch = completedSearch;
+      this.view.setResults(rankings[this.sort], pool);
     } catch (error) {
       if (generation !== this.generation || error?.name === "AbortError") return;
       this.view.setError(error);
