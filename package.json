@@ -1,0 +1,17 @@
+{
+  "name": "bilibili-precision-search",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "为 B 站网页搜索提供多路召回、相关性硬门槛和可解释重排的 Tampermonkey 用户脚本",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node --check src/constants.js && node --check src/text.js && node --check src/md5.js && node --check src/scoring.js && node --check src/api-adapter.js && node --check src/style.js && node --check src/ui.js && node --check src/main.js && node --check scripts/build.mjs",
+    "test": "node --test",
+    "verify": "npm run check && npm test && npm run build && node --check dist/BilibiliPrecisionSearch.user.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.9",
+    "jsdom": "^26.1.0"
+  }
+}

@@ -1,0 +1,13 @@
+// ==UserScript==
+// @name         B站精准搜索
+// @namespace    bilibili-precision-search.local
+// @version      1.0.0
+// @description  多路收集 B 站搜索候选，以相关性硬门槛过滤，再用质量分辅助重排并解释每条结果。
+// @author       Local userscript project
+// @license      MIT
+// @match        https://search.bilibili.com/*
+// @run-at       document-start
+// @noframes
+// @grant        GM_xmlhttpRequest
+// @connect      api.bilibili.com
+// ==/UserScript==

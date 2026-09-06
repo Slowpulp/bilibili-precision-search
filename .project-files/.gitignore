@@ -1,0 +1,4 @@
+manifests/
+operations/
+operations.jsonl
+state.json
